@@ -30,17 +30,6 @@ ENV/
 # Native build artifacts
 native/build/
 
-# ONNX Runtime (large binary distribution)
-onnxruntime-osx-arm64-1.23.2/
-onnxruntime-osx-arm64-1.23.2.tgz
-onnxruntime-*/
-*.tgz
-
-# Models (large files, download separately)
-models/*.onnx
-models/DeepFilterNet/*.onnx
-models/DeepFilterNet3_ll_onnx.tar.gz
-
 # Logs
 *.log
 logs/
