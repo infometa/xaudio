@@ -187,8 +187,7 @@ class MediaEngine:
             rtp_caps = Gst.Caps.from_string(
                 "application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload=96"
             )
-            rtp_capsfilter = Gst.ElementFactory.make("capsfilter", "rtp_caps")
-            rtp_capsfilter.set_property("caps", rtp_caps)
+            self.udpsrc.set_property("caps", rtp_caps)
 
             self.jitter = Gst.ElementFactory.make("rtpjitterbuffer", "jitter")
             self.jitter.set_property("latency", self.jitter_latency_ms)
@@ -238,7 +237,6 @@ class MediaEngine:
             elements.update({
                 "aec": self.aec,
                 "udpsrc": self.udpsrc,
-                "rtp_capsfilter": rtp_capsfilter,
                 "jitter": self.jitter,
                 "rtpdepay": rtpdepay,
                 "opusdec": opusdec,
@@ -269,7 +267,7 @@ class MediaEngine:
 
         # Decoder chain: UDP → RTP → Opus → tee
         if not is_listen_only:
-            self._link_many_or_raise("decoder", self.udpsrc, rtp_capsfilter, self.jitter, rtpdepay, opusdec, audconv2, audres2, caps2, playout_tee)
+            self._link_many_or_raise("decoder", self.udpsrc, self.jitter, rtpdepay, opusdec, audconv2, audres2, caps2, playout_tee)
             self._link_many_or_raise("playout", playout_q, sink)
 
         # VAD branch: tee → queue → convert → resample → caps → appsink
@@ -281,7 +279,7 @@ class MediaEngine:
         self._link_tee_src_to("capture→dfn", capture_tee, dfn_q)
         
         if not is_listen_only:
-            self._link_many_or_raise("decoder", self.udpsrc, rtp_capsfilter, self.jitter, rtpdepay, opusdec, audconv2, audres2, caps2, playout_tee)
+            self._link_many_or_raise("decoder", self.udpsrc, self.jitter, rtpdepay, opusdec, audconv2, audres2, caps2, playout_tee)
             self._link_many_or_raise("playout", playout_q, sink)
             self._link_tee_src_to("playout→sink", playout_tee, playout_q)
             self._link_tee_src_to("playout→render", playout_tee, render_q)
