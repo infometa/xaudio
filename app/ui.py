@@ -200,6 +200,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
 
     def _warn_port_occupied(self, local_port):
+        if self._auto_listen or self._auto_call:
+            return
         signaling_port = local_port + 1
         warnings = []
         if not self._check_port_available(local_port):
