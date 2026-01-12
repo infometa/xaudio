@@ -47,8 +47,10 @@ class MediaEngine:
                 
                 device_id = None
                 if props:
-                    device_id = props.get_uint("device.api.coreaudio.id")
-                    if device_id is None or device_id == 0:
+                    success, val = props.get_uint("device.api.coreaudio.id")
+                    if success and val > 0:
+                        device_id = val
+                    else:
                         device_id_str = props.get_string("device.id")
                         if device_id_str:
                             try:
