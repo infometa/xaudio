@@ -9,17 +9,21 @@ class MainWindow(QtWidgets.QMainWindow):
     connected_signal = QtCore.Signal(tuple)
     disconnected_signal = QtCore.Signal()
     
-    def __init__(self, media, signaling, metrics):
+    def __init__(self, media, signaling, metrics, initial_port=5004, auto_listen=False, auto_call=None):
         super().__init__()
         self.media = media
         self.signaling = signaling
         self.metrics = metrics
         self.logger = logging.getLogger("UI")
         self.is_listening = False
+        self._initial_port = initial_port
+        self._auto_listen = auto_listen
+        self._auto_call = auto_call
         self._setup_ui()
         self._connect_signals()
         self._refresh_devices()
         self._start_timer()
+        self._apply_initial_settings()
 
     def _setup_ui(self):
         self.setWindowTitle("TChat P2P Voice")
@@ -311,3 +315,17 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             event.accept()
             super().closeEvent(event)
+
+    def _apply_initial_settings(self):
+        self.local_port.setText(str(self._initial_port))
+        
+        if self._auto_call:
+            try:
+                ip, port = self._auto_call.rsplit(":", 1)
+                self.remote_ip.setText(ip)
+                self.remote_port.setText(port)
+                QtCore.QTimer.singleShot(500, self._on_call)
+            except ValueError:
+                self.logger.error(f"Invalid auto-call format: {self._auto_call}")
+        elif self._auto_listen:
+            QtCore.QTimer.singleShot(500, self._on_listen)

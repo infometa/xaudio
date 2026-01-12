@@ -1,24 +1,32 @@
+import argparse
 import os
 import sys
 import signal
 
-# Set GST_PLUGIN_PATH before GStreamer initialization
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="TChat P2P Voice Client")
+    parser.add_argument("--port", type=int, default=5004,
+                        help="Local RTP port (default: 5004)")
+    parser.add_argument("--auto-listen", action="store_true",
+                        help="Automatically start listening after launch")
+    parser.add_argument("--auto-call", type=str, metavar="IP:PORT",
+                        help="Automatically call remote after launch (e.g., 127.0.0.1:5004)")
+    return parser.parse_args()
+
+
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CUSTOM_PLUGINS_DIR = os.path.join(ROOT_DIR, "native", "build", "gst-plugins")
 HOMEBREW_PLUGINS_DIR = "/opt/homebrew/lib/gstreamer-1.0"
 
-# Set plugin path: custom plugins first, then homebrew
 os.environ["GST_PLUGIN_PATH"] = f"{CUSTOM_PLUGINS_DIR}:{HOMEBREW_PLUGINS_DIR}"
 
-# CRITICAL: Initialize GStreamer BEFORE importing PySide6
 import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst
 
-# Initialize GStreamer first
 Gst.init(['--gst-disable-registry-fork'])
 
-# Now import PySide6
 from PySide6 import QtWidgets, QtCore
 
 from .logging_config import setup_logging
@@ -29,6 +37,7 @@ from .vad import VADManager
 
 
 def main():
+    args = parse_args()
     setup_logging()
 
     app = QtWidgets.QApplication(sys.argv)
@@ -41,7 +50,13 @@ def main():
     from .signaling import Signaling
 
     signaling = Signaling()
-    window = MainWindow(media, signaling, metrics)
+    
+    window = MainWindow(
+        media, signaling, metrics,
+        initial_port=args.port,
+        auto_listen=args.auto_listen,
+        auto_call=args.auto_call
+    )
     window.resize(620, 560)
     window.show()
 
