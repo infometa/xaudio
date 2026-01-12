@@ -29,4 +29,4 @@ echo "========================================"
 echo ""
 
 cd "$ROOT_DIR"
-python -m app.main --port 5004 --auto-listen 2> >(grep -v "Class ResultReceiver\|Class GtkApplicationQuartzDelegate\|Class GNSMenuItem\|Class GNSMenu\|Class FilterComboBox\|Class gdkCoreCursor" >&2)
+python -m app.main --port 5004 2> >(grep -v "Class ResultReceiver\|Class GtkApplicationQuartzDelegate\|Class GNSMenuItem\|Class GNSMenu\|Class FilterComboBox\|Class gdkCoreCursor" >&2)
