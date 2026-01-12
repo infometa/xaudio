@@ -6,12 +6,6 @@ import time
 
 from gi.repository import Gst, GObject
 
-try:
-    import sounddevice as sd
-    HAS_SOUNDDEVICE = True
-except ImportError:
-    HAS_SOUNDDEVICE = False
-
 
 class MediaEngine:
     def __init__(self, metrics, vad_manager):
@@ -31,39 +25,51 @@ class MediaEngine:
         self.base_time = None
         self.vad_sample_count = 0
         self.vad_sink = None
-        self.lock = threading.Lock()  # Protects pipeline access and vad_sample_count
+        self.lock = threading.Lock()
 
     def list_devices(self):
-        """
-        List available audio devices using sounddevice library.
-        Returns (sources, sinks) where each is a list of dict with 'name' and 'id'.
-        """
         sources = []
         sinks = []
         
-        if not HAS_SOUNDDEVICE:
-            # Fallback: return empty lists, will use default devices
+        monitor = Gst.DeviceMonitor.new()
+        monitor.add_filter("Audio/Source", None)
+        monitor.add_filter("Audio/Sink", None)
+        
+        if not monitor.start():
+            self.logger.warning("Failed to start GStreamer DeviceMonitor")
             return sources, sinks
         
         try:
-            devices = sd.query_devices()
-            for idx, dev in enumerate(devices):
-                # For GStreamer, we use the device index as the ID
+            for device in monitor.get_devices():
+                props = device.get_properties()
+                device_class = device.get_device_class()
+                display_name = device.get_display_name()
+                
+                device_id = None
+                if props:
+                    device_id = props.get_uint("device.api.coreaudio.id")
+                    if device_id is None or device_id == 0:
+                        device_id_str = props.get_string("device.id")
+                        if device_id_str:
+                            try:
+                                device_id = int(device_id_str)
+                            except ValueError:
+                                device_id = None
+                
                 device_info = {
-                    "name": dev["name"],
-                    "id": str(idx),  # sounddevice uses integer index
+                    "name": display_name,
+                    "id": device_id,
                 }
                 
-                # Input devices (sources)
-                if dev["max_input_channels"] > 0:
-                    sources.append(device_info.copy())
-                
-                # Output devices (sinks)
-                if dev["max_output_channels"] > 0:
-                    sinks.append(device_info.copy())
+                if "Source" in device_class:
+                    sources.append(device_info)
+                elif "Sink" in device_class:
+                    sinks.append(device_info)
                     
         except Exception as e:
             self.logger.warning(f"Failed to enumerate audio devices: {e}")
+        finally:
+            monitor.stop()
         
         return sources, sinks
 
@@ -452,6 +458,9 @@ class MediaEngine:
         if not src:
             raise RuntimeError("Failed to create audio source element")
         
+        if device_id is not None:
+            self._set_if_prop(src, "device", device_id)
+        
         self.logger.info(f"Created audio source: {src.get_factory().get_name()}")
         return src
 
@@ -469,6 +478,9 @@ class MediaEngine:
         
         if not sink:
             raise RuntimeError("Failed to create audio sink element")
+        
+        if device_id is not None:
+            self._set_if_prop(sink, "device", device_id)
         
         self.logger.info(f"Created audio sink: {sink.get_factory().get_name()}")
         return sink
