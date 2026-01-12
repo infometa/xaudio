@@ -454,8 +454,6 @@ class MediaEngine:
         
         if device_id:
             self._set_if_prop(src, "device", device_id)
-        self._set_if_prop(src, "buffer-time", 10000)
-        self._set_if_prop(src, "latency-time", 10000)
         
         self.logger.info(f"Created audio source: {src.get_factory().get_name()}")
         return src
@@ -477,8 +475,6 @@ class MediaEngine:
         
         if device_id:
             self._set_if_prop(sink, "device", device_id)
-        self._set_if_prop(sink, "buffer-time", 10000)
-        self._set_if_prop(sink, "latency-time", 10000)
         
         self.logger.info(f"Created audio sink: {sink.get_factory().get_name()}")
         return sink

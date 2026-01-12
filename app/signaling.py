@@ -107,6 +107,8 @@ class Signaling:
         while self.running:
             try:
                 data, addr = self.sock.recvfrom(2048)
+            except socket.timeout:
+                continue
             except OSError:
                 break
             try:
