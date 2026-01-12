@@ -1,0 +1,5 @@
+PySide6>=6.5
+numpy>=1.24
+onnxruntime>=1.16
+PyGObject>=3.44; platform_system != "Windows"
+sounddevice>=0.4.0
