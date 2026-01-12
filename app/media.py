@@ -167,32 +167,30 @@ class MediaEngine:
         # Only build capture → VAD path, skip decoder/playout that causes negotiation failure
         is_listen_only = (remote_ip is None or remote_port is None)
         
-        if not is_listen_only:
-            rtp_caps = Gst.Caps.from_string(
-                "application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload=96"
-            )
-            rtp_capsfilter = Gst.ElementFactory.make("capsfilter", "rtp_caps")
-            rtp_capsfilter.set_property("caps", rtp_caps)
+        rtp_caps = Gst.Caps.from_string(
+            "application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload=96"
+        )
+        rtp_capsfilter = Gst.ElementFactory.make("capsfilter", "rtp_caps")
+        rtp_capsfilter.set_property("caps", rtp_caps)
 
-            self.jitter = Gst.ElementFactory.make("rtpjitterbuffer", "jitter")
-            self.jitter.set_property("latency", self.jitter_latency_ms)
-            self._set_if_prop(self.jitter, "drop-on-late", True)
-            self.jitter.set_property("do-lost", True)
+        self.jitter = Gst.ElementFactory.make("rtpjitterbuffer", "jitter")
+        self.jitter.set_property("latency", self.jitter_latency_ms)
+        self._set_if_prop(self.jitter, "drop-on-late", True)
+        self.jitter.set_property("do-lost", True)
 
-            rtpdepay = Gst.ElementFactory.make("rtpopusdepay", "rtpdepay")
-            opusdec = Gst.ElementFactory.make("opusdec", "opusdec")
-            audconv2 = Gst.ElementFactory.make("audioconvert", "audconv2")
-            audres2 = Gst.ElementFactory.make("audioresample", "audres2")
-            caps2 = Gst.ElementFactory.make("capsfilter", "caps2")
-            caps2.set_property(
-                "caps",
-                Gst.Caps.from_string("audio/x-raw,format=F32LE,rate=48000,channels=1,layout=interleaved"),
-            )
+        rtpdepay = Gst.ElementFactory.make("rtpopusdepay", "rtpdepay")
+        opusdec = Gst.ElementFactory.make("opusdec", "opusdec")
+        audconv2 = Gst.ElementFactory.make("audioconvert", "audconv2")
+        audres2 = Gst.ElementFactory.make("audioresample", "audres2")
+        caps2 = Gst.ElementFactory.make("capsfilter", "caps2")
+        caps2.set_property(
+            "caps",
+            Gst.Caps.from_string("audio/x-raw,format=F32LE,rate=48000,channels=1,layout=interleaved"),
+        )
 
-            playout_tee = Gst.ElementFactory.make("tee", "playout_tee")
-            playout_q = self._make_queue("playout_q")
-            render_q = self._make_queue("render_q")
-            # END if not is_listen_only
+        playout_tee = Gst.ElementFactory.make("tee", "playout_tee")
+        playout_q = self._make_queue("playout_q")
+        render_q = self._make_queue("render_q")
 
         # Build elements dict - only include decoder elements if not listen_only
         elements = {
@@ -217,24 +215,22 @@ class MediaEngine:
             "opusenc": opusenc,
             "rtppay": rtppay,
             "udpsink": self.udpsink,
+            "udpsrc": self.udpsrc,
+            "rtp_capsfilter": rtp_capsfilter,
+            "jitter": self.jitter,
+            "rtpdepay": rtpdepay,
+            "opusdec": opusdec,
+            "audconv2": audconv2,
+            "audres2": audres2,
+            "caps2": caps2,
+            "playout_tee": playout_tee,
+            "playout_q": playout_q,
+            "render_q": render_q,
+            "sink": sink,
         }
         
         if not is_listen_only:
-            elements.update({
-                "aec": self.aec,
-                "udpsrc": self.udpsrc,
-                "rtp_capsfilter": rtp_capsfilter,
-                "jitter": self.jitter,
-                "rtpdepay": rtpdepay,
-                "opusdec": opusdec,
-                "audconv2": audconv2,
-                "audres2": audres2,
-                "caps2": caps2,
-                "playout_tee": playout_tee,
-                "playout_q": playout_q,
-                "render_q": render_q,
-                "sink": sink,
-            })
+            elements["aec"] = self.aec
         
         for name, element in elements.items():
             if element is None:
@@ -252,14 +248,11 @@ class MediaEngine:
         # Encoder chain: DFN → Opus → RTP
         self._link_many_or_raise("encoder", dfn_q, dfn_in_caps, self.dfn, post_dfn_q, audconv_enc, audres_enc, enc_caps, opusenc, rtppay, self.udpsink)
 
-        if not is_listen_only:
-            # Decoder chain: UDP → RTP → Opus → tee
-            self._link_many_or_raise("decoder", self.udpsrc, rtp_capsfilter, self.jitter, rtpdepay, opusdec, audconv2, audres2, caps2, playout_tee)
+        # Decoder chain: UDP → RTP → Opus → tee (always built)
+        self._link_many_or_raise("decoder", self.udpsrc, rtp_capsfilter, self.jitter, rtpdepay, opusdec, audconv2, audres2, caps2, playout_tee)
 
-            # Playout chain: tee → sink
-            self._link_many_or_raise("playout", playout_q, sink)
-        else:
-            self.logger.info("Listen-only mode: skipping decoder/playout chain")
+        # Playout chain: tee → sink (always built)
+        self._link_many_or_raise("playout", playout_q, sink)
 
         # VAD branch: tee → queue → convert → resample → caps → appsink
         # This works in both modes since it comes from capture path
@@ -269,17 +262,17 @@ class MediaEngine:
         # DFN branch: tee → queue
         self._link_tee_src_to("capture→dfn", capture_tee, dfn_q)
         
-        # Playout branches
-        if not is_listen_only:
-            self._link_tee_src_to("playout→sink", playout_tee, playout_q)
-            self._link_tee_src_to("playout→render", playout_tee, render_q)
+        self._link_tee_src_to("playout→sink", playout_tee, playout_q)
+        self._link_tee_src_to("playout→render", playout_tee, render_q)
 
 # TEMPORARILY DISABLED:         # AEC render reference
-# TEMPORARILY DISABLED:         render_pad = self.aec.get_request_pad("render_sink")
-# TEMPORARILY DISABLED:         if not render_pad:
-# TEMPORARILY DISABLED:             raise RuntimeError("Failed to get AEC render pad")
-# TEMPORARILY DISABLED:         render_src = render_q.get_static_pad("src")
-# TEMPORARILY DISABLED:         self._pad_link_or_raise("render→aec", render_src, render_pad)
+        if not is_listen_only and self.aec:
+            render_pad = self.aec.get_request_pad("render_sink")
+            if render_pad:
+                render_src = render_q.get_static_pad("src")
+                self._pad_link_or_raise("render→aec", render_src, render_pad)
+            else:
+                self.logger.warning("AEC render pad not available")
 
         self.bus = self.pipeline.get_bus()
         self.bus.add_signal_watch()
@@ -491,6 +484,8 @@ class MediaEngine:
         return sink
 
     def _adapt_jitter(self, packets_in_queue):
+        if not self.jitter:
+            return
         if packets_in_queue > 6 and self.jitter_latency_ms < 60:
             self.jitter_latency_ms = min(60, self.jitter_latency_ms + 5)
             self.jitter.set_property("latency", self.jitter_latency_ms)

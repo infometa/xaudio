@@ -24,7 +24,7 @@ class Signaling:
         self.call_id = None
         self.tie = None
         self.last_seen = 0.0
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
 
     def start_listen(self, local_port):
         if self.sock:
@@ -76,6 +76,7 @@ class Signaling:
     def _set_connected(self):
         if self.state != "connected":
             self.state = "connected"
+            self.last_seen = time.time()
             self.logger.info("Call connected to %s:%d", self.remote_addr[0], self.remote_addr[1])
             if self.on_connected:
                 self.on_connected(self.remote_addr)
@@ -121,6 +122,8 @@ class Signaling:
                 self._handle_keepalive(addr)
             elif msg_type == "BYE":
                 self._handle_bye(addr)
+            elif msg_type == "BUSY":
+                self._handle_busy(addr)
 
     def _handle_hello(self, msg, addr):
         remote_tie = int(msg.get("tie", 0))
@@ -161,12 +164,30 @@ class Signaling:
         if self.remote_addr and addr == self.remote_addr:
             self._set_disconnected("remote bye")
 
+    def _handle_busy(self, addr):
+        with self.lock:
+            if self.state == "calling":
+                self.logger.info("Remote is busy")
+                self._set_disconnected("remote busy")
+
     def _keepalive_loop(self):
+        hello_retries = 0
+        max_hello_retries = 5
         while self.running:
             time.sleep(1.0)
             with self.lock:
-                if self.state == "connected":
+                if self.state == "calling":
+                    hello_retries += 1
+                    if hello_retries <= max_hello_retries:
+                        self.logger.info("Retrying HELLO (%d/%d)", hello_retries, max_hello_retries)
+                        self._send({"type": "HELLO", "call_id": self.call_id, "tie": self.tie})
+                    else:
+                        self._set_disconnected("no response")
+                        hello_retries = 0
+                elif self.state == "connected":
+                    hello_retries = 0
                     self._send({"type": "KEEPALIVE"})
-                if self.state == "connected" and self.last_seen:
-                    if time.time() - self.last_seen > 3.0:
+                    if self.last_seen and time.time() - self.last_seen > 5.0:
                         self._set_disconnected("keepalive timeout")
+                else:
+                    hello_retries = 0
