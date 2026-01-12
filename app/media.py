@@ -502,6 +502,11 @@ class MediaEngine:
         if not element:
             return
         if element.find_property(prop):
+            if prop == "device" and isinstance(value, str):
+                try:
+                    value = int(value)
+                except ValueError:
+                    pass
             element.set_property(prop, value)
 
     def _link_many_or_raise(self, label, *elems):

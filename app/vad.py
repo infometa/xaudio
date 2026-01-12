@@ -46,7 +46,7 @@ class VADWorker(threading.Thread):
     def _reset_state(self):
         self.state = np.zeros(self.STATE_SHAPE, dtype=np.float32)
         self.context = np.zeros(self.CONTEXT_SIZE, dtype=np.float32)
-        self.sr = np.int64(self.SAMPLE_RATE)
+        self.sr = np.array(self.SAMPLE_RATE, dtype=np.int64)
 
     def load_model(self):
         if ort is None:
