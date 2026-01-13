@@ -38,6 +38,14 @@ from .vad import VADManager
 
 def main():
     args = parse_args()
+    env_local_port = os.getenv("TCHAT_DEFAULT_LOCAL_PORT")
+    if env_local_port:
+        try:
+            env_port = int(env_local_port)
+        except ValueError:
+            env_port = None
+        if env_port and args.port == 5004:
+            args.port = env_port
     setup_logging()
 
     app = QtWidgets.QApplication(sys.argv)
@@ -46,6 +54,8 @@ def main():
     model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "models", "silero_vad.onnx"))
     vad = VADManager(metrics, model_path)
     media = MediaEngine(metrics, vad)
+    vad.preload()
+    media.prewarm()
 
     from .signaling import Signaling
 
@@ -57,7 +67,7 @@ def main():
         auto_listen=args.auto_listen,
         auto_call=args.auto_call
     )
-    window.resize(620, 560)
+    window.resize(960, 560)
     window.show()
 
     def handle_sigint(signum, frame):

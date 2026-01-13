@@ -1,6 +1,7 @@
 import logging
 import os
 import threading
+from collections import deque
 
 import numpy as np
 
@@ -35,10 +36,23 @@ class VADWorker(threading.Thread):
         self.stop_event = stop_event
         self.logger = logging.getLogger("VAD")
         self.session = None
+
+        def _env_float(name, default):
+            try:
+                return float(os.getenv(name, default))
+            except ValueError:
+                return default
+
+        self.prob_on = _env_float("VAD_PROB_ON", 0.5)
+        self.prob_off = _env_float("VAD_PROB_OFF", 0.35)
+        self.energy_on_db = _env_float("VAD_ENERGY_DB_ON", -40.0)
+        self.energy_off_db = _env_float("VAD_ENERGY_DB_OFF", -50.0)
+        self.use_energy_fallback = os.getenv("VAD_ENERGY_FALLBACK", "1") != "0"
         
         self._reset_state()
         
-        self.buffer_16k = np.zeros(0, dtype=np.float32)
+        self.buffer_16k = deque()
+        self.buffer_samples = 0
         self.speaking = False
         self.above_ms = 0.0
         self.below_ms = 0.0
@@ -49,6 +63,8 @@ class VADWorker(threading.Thread):
         self.sr = np.array(self.SAMPLE_RATE, dtype=np.int64)
 
     def load_model(self):
+        if self.session is not None:
+            return True
         if ort is None:
             self.logger.warning("onnxruntime not available; VAD disabled")
             return False
@@ -78,10 +94,10 @@ class VADWorker(threading.Thread):
             return False
 
     def run(self):
-        if not self.load_model():
-            self.logger.warning("VAD disabled - model not loaded")
-            return
-            
+        model_ok = self.load_model()
+        if not model_ok:
+            self.logger.warning("VAD running in energy-only mode")
+
         self.logger.info("VAD worker started")
         frame_ms = self.WINDOW_SIZE / self.SAMPLE_RATE * 1000.0
         frame_count = 0
@@ -89,6 +105,8 @@ class VADWorker(threading.Thread):
         max_errors = 5
         
         self._reset_state()
+        self.buffer_16k.clear()
+        self.buffer_samples = 0
 
         while not self.stop_event.is_set():
             frame = self.ring.pop(timeout=0.1)
@@ -100,64 +118,96 @@ class VADWorker(threading.Thread):
                 continue
                 
             pcm_16k = pcm_s16.astype(np.float32) / 32768.0
-            self.buffer_16k = np.concatenate([self.buffer_16k, pcm_16k])
+            self.buffer_16k.append(pcm_16k)
+            self.buffer_samples += pcm_16k.size
             
-            while self.buffer_16k.size >= self.WINDOW_SIZE:
-                chunk = self.buffer_16k[:self.WINDOW_SIZE]
-                self.buffer_16k = self.buffer_16k[self.WINDOW_SIZE:]
+            while self.buffer_samples >= self.WINDOW_SIZE:
+                chunk = self._pop_samples(self.WINDOW_SIZE)
                 
+                rms = float(np.sqrt(np.mean(chunk * chunk)))
+                energy_db = 20.0 * np.log10(max(rms, 1e-12))
+                denom = max(1e-6, self.energy_on_db - self.energy_off_db)
+                energy_prob = (energy_db - self.energy_off_db) / denom
+                energy_prob = float(np.clip(energy_prob, 0.0, 1.0))
+
                 input_data = np.concatenate([self.context, chunk])
                 inp = input_data.reshape(1, -1).astype(np.float32)
-                
-                try:
-                    if not self.session:
-                        break
-                    
-                    feed = {
-                        'input': inp,
-                        'state': self.state,
-                        'sr': self.sr
-                    }
-                    
-                    res = self.session.run(None, feed)
-                    
-                    prob = res[0]
-                    if len(res) > 1:
-                        self.state = res[1]
-                    
-                    self.context = chunk[-self.CONTEXT_SIZE:]
+                prob_value = energy_prob
+
+                if self.session:
+                    try:
+                        feed = {
+                            'input': inp,
+                            'state': self.state,
+                            'sr': self.sr
+                        }
                         
-                    prob_value = float(np.squeeze(prob))
-                    error_count = 0
-                    
-                except Exception as exc:
-                    error_count += 1
-                    if error_count <= max_errors:
-                        self.logger.exception("VAD inference failed (input shape: %s)", inp.shape)
-                    elif error_count == max_errors + 1:
-                        self.logger.error("VAD inference errors exceeded limit, suppressing further logs")
-                    prob_value = 0.0
-                    continue
-                    
+                        res = self.session.run(None, feed)
+                        
+                        prob = res[0]
+                        if len(res) > 1:
+                            self.state = res[1]
+                            
+                        prob_value = float(np.squeeze(prob))
+                        if self.use_energy_fallback:
+                            prob_value = max(prob_value, energy_prob)
+                        error_count = 0
+                    except Exception:
+                        error_count += 1
+                        if error_count <= max_errors:
+                            self.logger.exception("VAD inference failed (input shape: %s)", inp.shape)
+                        elif error_count == max_errors + 1:
+                            self.logger.error("VAD inference errors exceeded limit, suppressing further logs")
+                        if not self.use_energy_fallback:
+                            prob_value = 0.0
+
+                self.context = chunk[-self.CONTEXT_SIZE:]
                 frame_count += 1
                 if frame_count % 30 == 0:
-                    self.logger.debug("VAD prob=%.3f speaking=%s", prob_value, self.speaking)
-                    
-                if prob_value > 0.6:
-                    self.above_ms += frame_ms
-                    self.below_ms = 0.0
-                elif prob_value < 0.4:
-                    self.below_ms += frame_ms
-                    self.above_ms = 0.0
-                    
-                if not self.speaking and self.above_ms >= 30.0:
-                    self.speaking = True
-                    self.logger.info("Speech started (prob=%.2f)", prob_value)
-                elif self.speaking and self.below_ms >= 200.0:
-                    self.speaking = False
-                    self.logger.info("Speech stopped (prob=%.2f)", prob_value)
-                    
-                self.metrics.update_vad(prob_value, self.speaking)
+                    if self.session:
+                        self.logger.debug("VAD prob=%.3f speaking=%s", prob_value, self.speaking)
+                    else:
+                        self.logger.debug("VAD energy=%.1f dB speaking=%s", energy_db, self.speaking)
+
+                self._update_speaking(prob_value, energy_db, frame_ms)
+                self.metrics.update_vad(prob_value, self.speaking, energy_db)
+
+    def _pop_samples(self, count):
+        out = np.empty(count, dtype=np.float32)
+        filled = 0
+        while filled < count and self.buffer_16k:
+            buf = self.buffer_16k[0]
+            take = min(count - filled, buf.size)
+            out[filled:filled + take] = buf[:take]
+            if take == buf.size:
+                self.buffer_16k.popleft()
+            else:
+                self.buffer_16k[0] = buf[take:]
+            filled += take
+            self.buffer_samples -= take
+        return out
+
+    def _update_speaking(self, prob_value, energy_db, frame_ms):
+        if self.use_energy_fallback:
+            above = prob_value > self.prob_on or energy_db > self.energy_on_db
+            below = prob_value < self.prob_off and energy_db < self.energy_off_db
+        else:
+            above = prob_value > self.prob_on
+            below = prob_value < self.prob_off
+
+        if above:
+            self.above_ms += frame_ms
+            self.below_ms = 0.0
+        elif below:
+            self.below_ms += frame_ms
+            self.above_ms = 0.0
+
+        if not self.speaking and self.above_ms >= 30.0:
+            self.speaking = True
+            self.logger.info("Speech started (prob=%.2f, energy=%.1f dB)", prob_value, energy_db)
+        elif self.speaking and self.below_ms >= 200.0:
+            self.speaking = False
+            self.logger.info("Speech stopped (prob=%.2f, energy=%.1f dB)", prob_value, energy_db)
 
 
 class VADManager:
@@ -169,6 +219,7 @@ class VADManager:
         self.worker = VADWorker(self.ring, metrics, model_path, self.stop_event)
         self.logger = logging.getLogger("VAD")
         self.frame_count = 0
+        self._preloaded = False
 
     def push_frame(self, frame_bytes):
         self.frame_count += 1
@@ -183,10 +234,24 @@ class VADManager:
             self.logger.warning("VAD worker already running")
             return
         self.stop_event.clear()
-        self.worker = VADWorker(self.ring, self.metrics, self.model_path, self.stop_event)
+        if not self._preloaded:
+            self.worker = VADWorker(self.ring, self.metrics, self.model_path, self.stop_event)
+        else:
+            self._preloaded = False
         self.worker.start()
 
     def stop(self):
         self.stop_event.set()
         if self.worker.is_alive():
             self.worker.join(timeout=2.0)
+
+    def preload(self):
+        if self._preloaded:
+            return
+        try:
+            ok = self.worker.load_model()
+            if ok:
+                self._preloaded = True
+                self.logger.info("VAD model preloaded")
+        except Exception as exc:
+            self.logger.warning("VAD preload failed: %s", exc)

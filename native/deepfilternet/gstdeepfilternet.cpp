@@ -27,6 +27,9 @@ struct _GstDeepFilterNet {
     guint frame_samples;
     guint frame_bytes;
     gboolean bypass;
+    double mix;
+    double post_filter;
+    float post_filter_state;
     gint consecutive_over;
     gint64 cooldown_until;
     guint64 bypass_count;
@@ -94,6 +97,8 @@ enum {
     PROP_MODEL_PATH,
     PROP_MODEL_DIR,
     PROP_BYPASS,
+    PROP_MIX,
+    PROP_POST_FILTER,
     PROP_INPUT_NAME,
     PROP_OUTPUT_NAME,
 };
@@ -877,6 +882,22 @@ static GstFlowReturn dfn_process_frame(GstDeepFilterNet *self, GstBuffer *inbuf)
         self->bypass_count += 1;
     }
 
+    if (!bypass && self->mix < 0.999) {
+        double wet = self->mix;
+        double dry = 1.0 - wet;
+        for (guint i = 0; i < self->frame_samples; ++i) {
+            out[i] = static_cast<float>((out[i] * wet) + (in[i] * dry));
+        }
+    }
+
+    if (!bypass && self->post_filter > 0.0) {
+        float alpha = static_cast<float>(self->post_filter);
+        for (guint i = 0; i < self->frame_samples; ++i) {
+            self->post_filter_state = (alpha * self->post_filter_state) + ((1.0f - alpha) * out[i]);
+            out[i] = self->post_filter_state;
+        }
+    }
+
     for (guint i = 0; i < self->frame_samples; ++i) {
         if (out[i] > 0.98f) {
             out[i] = 0.98f;
@@ -938,6 +959,18 @@ static GstFlowReturn gst_deepfilternet_chain(GstPad *pad, GstObject *parent, Gst
     return GST_FLOW_OK;
 }
 
+static gboolean gst_deepfilternet_sink_event(GstPad *pad, GstObject *parent, GstEvent *event) {
+    GstDeepFilterNet *self = GST_DEEPFILTERNET(parent);
+    GstEvent *forward = gst_event_ref(event);
+    gboolean ret = gst_pad_event_default(pad, parent, event);
+    if (ret && self->srcpad) {
+        gst_pad_push_event(self->srcpad, forward);
+    } else {
+        gst_event_unref(forward);
+    }
+    return ret;
+}
+
 static void gst_deepfilternet_set_property(GObject *object, guint prop_id, const GValue *value, GParamSpec *pspec) {
     GstDeepFilterNet *self = GST_DEEPFILTERNET(object);
     switch (prop_id) {
@@ -951,6 +984,25 @@ static void gst_deepfilternet_set_property(GObject *object, guint prop_id, const
             break;
         case PROP_BYPASS:
             self->bypass = g_value_get_boolean(value);
+            break;
+        case PROP_MIX:
+            self->mix = g_value_get_double(value);
+            if (self->mix < 0.0) {
+                self->mix = 0.0;
+            } else if (self->mix > 1.0) {
+                self->mix = 1.0;
+            }
+            break;
+        case PROP_POST_FILTER:
+            self->post_filter = g_value_get_double(value);
+            if (self->post_filter < 0.0) {
+                self->post_filter = 0.0;
+            } else if (self->post_filter > 0.98) {
+                self->post_filter = 0.98;
+            }
+            if (self->post_filter == 0.0) {
+                self->post_filter_state = 0.0f;
+            }
             break;
         case PROP_INPUT_NAME:
             g_free(self->input_name);
@@ -977,6 +1029,12 @@ static void gst_deepfilternet_get_property(GObject *object, guint prop_id, GValu
             break;
         case PROP_BYPASS:
             g_value_set_boolean(value, self->bypass);
+            break;
+        case PROP_MIX:
+            g_value_set_double(value, self->mix);
+            break;
+        case PROP_POST_FILTER:
+            g_value_set_double(value, self->post_filter);
             break;
         case PROP_INPUT_NAME:
             g_value_set_string(value, self->input_name);
@@ -1060,6 +1118,14 @@ static void gst_deepfilternet_class_init(GstDeepFilterNetClass *klass) {
         g_param_spec_boolean("bypass", "Bypass", "Bypass inference", FALSE, GParamFlags(G_PARAM_READWRITE)));
     g_object_class_install_property(
         gobject_class,
+        PROP_MIX,
+        g_param_spec_double("mix", "Mix", "Dry/Wet mix (0.0=orig, 1.0=processed)", 0.0, 1.0, 1.0, GParamFlags(G_PARAM_READWRITE)));
+    g_object_class_install_property(
+        gobject_class,
+        PROP_POST_FILTER,
+        g_param_spec_double("post-filter", "Post Filter", "Post filter strength (0.0=off, 1.0=max)", 0.0, 1.0, 0.0, GParamFlags(G_PARAM_READWRITE)));
+    g_object_class_install_property(
+        gobject_class,
         PROP_INPUT_NAME,
         g_param_spec_string("input-name", "Input Name", "ONNX input name", nullptr, GParamFlags(G_PARAM_READWRITE)));
     g_object_class_install_property(
@@ -1073,6 +1139,9 @@ static void gst_deepfilternet_init(GstDeepFilterNet *self) {
     self->frame_bytes = self->frame_samples * sizeof(float);
     self->adapter = gst_adapter_new();
     self->bypass = FALSE;
+    self->mix = 1.0;
+    self->post_filter = 0.0;
+    self->post_filter_state = 0.0f;
     self->consecutive_over = 0;
     self->cooldown_until = 0;
     self->bypass_count = 0;
@@ -1112,6 +1181,7 @@ static void gst_deepfilternet_init(GstDeepFilterNet *self) {
 
     self->sinkpad = gst_pad_new_from_static_template(&sink_template, "sink");
     gst_pad_set_chain_function(self->sinkpad, GST_DEBUG_FUNCPTR(gst_deepfilternet_chain));
+    gst_pad_set_event_function(self->sinkpad, GST_DEBUG_FUNCPTR(gst_deepfilternet_sink_event));
     gst_element_add_pad(GST_ELEMENT(self), self->sinkpad);
 
     self->srcpad = gst_pad_new_from_static_template(&src_template, "src");

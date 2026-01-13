@@ -216,7 +216,7 @@ If you use a single-model export, make sure I/O names and shapes match, or set p
 
 If you use the standard Silero model (often 512 samples), replace the model and adjust input shape accordingly.
 
-Note: 48k -> 16k downsampling in VAD thread uses simple decimation. Replace with a high-quality resampler for production.
+Note: 48k -> 16k downsampling for VAD uses GStreamer `audioresample` with `quality=4`. Increase quality if you need more accuracy at higher CPU cost.
 
 ## Run
 
@@ -264,6 +264,26 @@ UI shows:
 - Jitter buffer depth (if available)
 - Mic->send latency estimate
 
+## Runtime Knobs
+
+- `TCHAT_DISABLE_AEC=1` / `TCHAT_DISABLE_DFN=1`: force bypass.
+- `TCHAT_AEC_AUTO_DELAY`: enable automatic AEC delay estimation (default 1).
+- `TCHAT_AEC_DELAY_MS`: AEC stream delay in ms (0-500).
+- `TCHAT_DFN_MIX`: DFN dry/wet mix (0.0-1.0).
+- `TCHAT_DFN_POST_FILTER`: DFN post filter strength (0.0-1.0).
+- `TCHAT_LIMITER_THRESHOLD_DB`: limiter threshold in dB (default -1.0).
+- `TCHAT_LIMITER_ATTACK_MS` / `TCHAT_LIMITER_RELEASE_MS`: limiter time constants.
+- `TCHAT_OPUS_BITRATE`: Opus bitrate (bps, default 24000).
+- `TCHAT_OPUS_COMPLEXITY`: Opus complexity (0-10, default 10).
+- `TCHAT_OPUS_FEC`: enable Opus in-band FEC (0/1).
+- `TCHAT_OPUS_DTX`: enable Opus DTX (0/1).
+- `TCHAT_OPUS_PACKET_LOSS`: expected packet loss percentage for FEC tuning.
+- `TCHAT_JITTER_LATENCY_MS`: base jitter buffer latency in ms (default 40).
+- `TCHAT_SIGNAL_BIND`: signaling bind IP (default 0.0.0.0).
+- `TCHAT_SIGNAL_ALLOWLIST`: comma-separated IP allowlist (optional).
+- `TCHAT_SIGNAL_TOKEN`: shared signaling token (optional).
+- `TCHAT_DEFAULT_LOCAL_PORT` / `TCHAT_DEFAULT_REMOTE_IP` / `TCHAT_DEFAULT_REMOTE_PORT`: UI defaults.
+
 ## Packaging
 
 ### macOS
@@ -282,9 +302,19 @@ Copy the GStreamer runtime into the app bundle and set `GST_PLUGIN_PATH` to `gst
 
 Copy the GStreamer runtime and plugin DLLs into `dist\TChat`.
 
+## Dependency Locking
+
+Generate a lock file inside the active environment:
+
+```bash
+./scripts/freeze_requirements.sh
+```
+
 ## Troubleshooting
 
 - No audio: verify `GST_PLUGIN_PATH` includes `native/build/gst-plugins` and GStreamer version matches.
 - Echo: ensure AEC3 render reference is connected (downlink decode tee -> AEC render pad).
 - Plugin not found: set `GST_DEBUG=3` and check for `webrtcaec3` / `deepfilternet`.
 - Port busy: change local RTP port; signaling uses RTP+1.
+- VAD too insensitive: adjust `VAD_PROB_ON/VAD_PROB_OFF` or `VAD_ENERGY_DB_ON/VAD_ENERGY_DB_OFF` environment variables.
+- Debugging: disable AEC/DFN with `TCHAT_DISABLE_AEC=1` or `TCHAT_DISABLE_DFN=1`.

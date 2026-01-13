@@ -50,3 +50,9 @@ temp/
 
 # GStreamer debug
 *.dot
+
+# Reports
+report/
+
+# Archives
+*.tgz

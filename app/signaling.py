@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import socket
 import threading
 import time
@@ -25,6 +26,10 @@ class Signaling:
         self.tie = None
         self.last_seen = 0.0
         self.lock = threading.RLock()
+        self.bind_ip = os.getenv("TCHAT_SIGNAL_BIND", "0.0.0.0").strip() or "0.0.0.0"
+        self.token = os.getenv("TCHAT_SIGNAL_TOKEN", "").strip()
+        allowlist_raw = os.getenv("TCHAT_SIGNAL_ALLOWLIST", "").strip()
+        self.allowlist = {item for item in allowlist_raw.replace(" ", ",").split(",") if item}
 
     def start_listen(self, local_port):
         if self.sock:
@@ -32,13 +37,15 @@ class Signaling:
         self.local_port = local_port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(1.0)
-        self.sock.bind(("0.0.0.0", local_port))
+        self.sock.bind((self.bind_ip, local_port))
         self.running = True
         self.recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self.recv_thread.start()
         self.keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
         self.keepalive_thread.start()
-        self.logger.info("Signaling listening on %s", local_port)
+        self.logger.info("Signaling listening on %s (%s)", local_port, self.bind_ip)
+        if self.bind_ip == "0.0.0.0" and not self.allowlist and not self.token:
+            self.logger.warning("Signaling is exposed on all interfaces without allowlist/token")
 
     def stop(self):
         self.running = False
@@ -98,6 +105,8 @@ class Signaling:
             payload = dict(payload)
             payload["ts"] = time.time()
             payload["id"] = self.call_id
+            if self.token:
+                payload["token"] = self.token
             try:
                 self.sock.sendto(json.dumps(payload).encode("utf-8"), self.remote_addr)
             except OSError as exc:
@@ -115,15 +124,17 @@ class Signaling:
                 msg = json.loads(data.decode("utf-8"))
             except json.JSONDecodeError:
                 continue
+            if not self._accept_message(msg, addr):
+                continue
             msg_type = msg.get("type")
             if msg_type == "HELLO":
                 self._handle_hello(msg, addr)
             elif msg_type == "ACK":
                 self._handle_ack(msg, addr)
             elif msg_type == "KEEPALIVE":
-                self._handle_keepalive(addr)
+                self._handle_keepalive(msg, addr)
             elif msg_type == "BYE":
-                self._handle_bye(addr)
+                self._handle_bye(msg, addr)
             elif msg_type == "BUSY":
                 self._handle_busy(addr)
 
@@ -154,15 +165,24 @@ class Signaling:
 
     def _handle_ack(self, msg, addr):
         with self.lock:
+            msg_id = msg.get("call_id") or msg.get("id")
+            if self.call_id and msg_id and msg_id != self.call_id:
+                return
             if self.state == "calling" and addr == self.remote_addr:
                 self._set_connected()
 
-    def _handle_keepalive(self, addr):
+    def _handle_keepalive(self, msg, addr):
         with self.lock:
+            msg_id = msg.get("call_id") or msg.get("id")
+            if self.call_id and msg_id and msg_id != self.call_id:
+                return
             if self.remote_addr and addr == self.remote_addr:
                 self.last_seen = time.time()
 
-    def _handle_bye(self, addr):
+    def _handle_bye(self, msg, addr):
+        msg_id = msg.get("call_id") or msg.get("id")
+        if self.call_id and msg_id and msg_id != self.call_id:
+            return
         if self.remote_addr and addr == self.remote_addr:
             self._set_disconnected("remote bye")
 
@@ -193,3 +213,12 @@ class Signaling:
                         self._set_disconnected("keepalive timeout")
                 else:
                     hello_retries = 0
+
+    def _accept_message(self, msg, addr):
+        if self.allowlist and addr[0] not in self.allowlist:
+            return False
+        if self.token:
+            if msg.get("token") != self.token:
+                self.logger.warning("Signaling token mismatch from %s:%d", addr[0], addr[1])
+                return False
+        return True
