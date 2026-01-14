@@ -15,6 +15,10 @@ set(WEBRTC_ROOT "" CACHE PATH "Path to WebRTC build output or source root")
 set(WEBRTC_INCLUDE_DIR "" CACHE PATH "WebRTC include directory")
 set(WEBRTC_LIB_DIR "" CACHE PATH "WebRTC library directory")
 set(WEBRTC_LIBS "" CACHE STRING "WebRTC libraries to link")
+if (WIN32)
+    option(WEBRTC_LINK_LIBS "Link WebRTC .lib archives on Windows" OFF)
+    option(WEBRTC_LINK_OBJS "Link WebRTC .obj files on Windows" ON)
+endif()
 
 set(ONNXRUNTIME_ROOT "" CACHE PATH "Path to ONNX Runtime")
 set(ONNXRUNTIME_INCLUDE_DIR "" CACHE PATH "ONNX Runtime include directory")
@@ -128,27 +132,32 @@ endif()
 
 if (WEBRTC_LIB_DIR AND WEBRTC_LIBS STREQUAL "")
     if (WIN32)
-        file(GLOB_RECURSE WEBRTC_LIB_FILES
-            "${WEBRTC_LIB_ROOT}/api/**/*.lib"
-            "${WEBRTC_LIB_ROOT}/modules/audio_processing/**/*.lib"
-            "${WEBRTC_LIB_ROOT}/common_audio/**/*.lib"
-            "${WEBRTC_LIB_ROOT}/audio/utility/**/*.lib"
-            "${WEBRTC_LIB_ROOT}/rtc_base/**/*.lib"
-            "${WEBRTC_LIB_ROOT}/system_wrappers/**/*.lib"
-            "${WEBRTC_LIB_ROOT}/third_party/pffft/**/*.lib"
-            "${WEBRTC_LIB_ROOT}/third_party/protobuf/**/*.lib"
-        )
-        file(GLOB_RECURSE WEBRTC_OBJ_FILES
-            "${WEBRTC_LIB_ROOT}/api/**/*.obj"
-            "${WEBRTC_LIB_ROOT}/modules/audio_processing/**/*.obj"
-            "${WEBRTC_LIB_ROOT}/common_audio/**/*.obj"
-            "${WEBRTC_LIB_ROOT}/audio/utility/**/*.obj"
-            "${WEBRTC_LIB_ROOT}/rtc_base/**/*.obj"
-            "${WEBRTC_LIB_ROOT}/system_wrappers/**/*.obj"
-            "${WEBRTC_LIB_ROOT}/third_party/pffft/**/*.obj"
-            "${WEBRTC_LIB_ROOT}/third_party/protobuf/**/*.obj"
-        )
-        list(APPEND WEBRTC_LIBS ${WEBRTC_LIB_FILES} ${WEBRTC_OBJ_FILES})
+        if (WEBRTC_LINK_LIBS)
+            file(GLOB_RECURSE WEBRTC_LIB_FILES
+                "${WEBRTC_LIB_ROOT}/api/**/*.lib"
+                "${WEBRTC_LIB_ROOT}/modules/audio_processing/**/*.lib"
+                "${WEBRTC_LIB_ROOT}/common_audio/**/*.lib"
+                "${WEBRTC_LIB_ROOT}/audio/utility/**/*.lib"
+                "${WEBRTC_LIB_ROOT}/rtc_base/**/*.lib"
+                "${WEBRTC_LIB_ROOT}/system_wrappers/**/*.lib"
+                "${WEBRTC_LIB_ROOT}/third_party/pffft/**/*.lib"
+                "${WEBRTC_LIB_ROOT}/third_party/protobuf/**/*.lib"
+            )
+            list(APPEND WEBRTC_LIBS ${WEBRTC_LIB_FILES})
+        endif()
+        if (WEBRTC_LINK_OBJS)
+            file(GLOB_RECURSE WEBRTC_OBJ_FILES
+                "${WEBRTC_LIB_ROOT}/api/**/*.obj"
+                "${WEBRTC_LIB_ROOT}/modules/audio_processing/**/*.obj"
+                "${WEBRTC_LIB_ROOT}/common_audio/**/*.obj"
+                "${WEBRTC_LIB_ROOT}/audio/utility/**/*.obj"
+                "${WEBRTC_LIB_ROOT}/rtc_base/**/*.obj"
+                "${WEBRTC_LIB_ROOT}/system_wrappers/**/*.obj"
+                "${WEBRTC_LIB_ROOT}/third_party/pffft/**/*.obj"
+                "${WEBRTC_LIB_ROOT}/third_party/protobuf/**/*.obj"
+            )
+            list(APPEND WEBRTC_LIBS ${WEBRTC_OBJ_FILES})
+        endif()
     else()
     file(GLOB WEBRTC_APM_LIBS "${WEBRTC_LIB_ROOT}/modules/audio_processing/*.a")
     file(GLOB_RECURSE WEBRTC_APM_SUB_LIBS "${WEBRTC_LIB_ROOT}/modules/audio_processing/**/*.a")

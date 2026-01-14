@@ -24,9 +24,22 @@ if ($GstRoot -and (Test-Path $GstRoot)) {
 $WebRtcInclude = $env:WEBRTC_INCLUDE_DIR
 $WebRtcLibDir = $env:WEBRTC_LIB_DIR
 $WebRtcLibs = $env:WEBRTC_LIBS
+$WebRtcLinkLibs = $env:WEBRTC_LINK_LIBS
+$WebRtcLinkObjs = $env:WEBRTC_LINK_OBJS
 $OnnxInclude = $env:ONNXRUNTIME_INCLUDE_DIR
 $OnnxLibDir = $env:ONNXRUNTIME_LIB_DIR
 $OnnxLibs = $env:ONNXRUNTIME_LIBS
+
+function Normalize-Bool([string]$Value, [string]$Default) {
+    if (-not $Value) {
+        return $Default
+    }
+    switch -Regex ($Value.Trim().ToLower()) {
+        "^(1|on|true|yes)$" { return "ON" }
+        "^(0|off|false|no)$" { return "OFF" }
+        default { return $Default }
+    }
+}
 
 if (-not $WebRtcRoot -or -not (Test-Path $WebRtcRoot)) {
     throw "WEBRTC_ROOT 未设置或路径不存在：$WebRtcRoot"
@@ -69,7 +82,9 @@ $Args = @(
     "-DCMAKE_BUILD_TYPE=Release",
     "-DCMAKE_CXX_STANDARD=20",
     "-DWEBRTC_ROOT=$WebRtcRoot",
-    "-DWEBRTC_INCLUDE_DIR=$WebRtcInclude"
+    "-DWEBRTC_INCLUDE_DIR=$WebRtcInclude",
+    "-DWEBRTC_LINK_LIBS=$(Normalize-Bool $WebRtcLinkLibs 'OFF')",
+    "-DWEBRTC_LINK_OBJS=$(Normalize-Bool $WebRtcLinkObjs 'ON')"
 )
 if ($WebRtcLibDir) {
     $Args += "-DWEBRTC_LIB_DIR=$WebRtcLibDir"

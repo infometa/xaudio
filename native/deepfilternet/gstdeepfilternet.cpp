@@ -375,15 +375,16 @@ static std::basic_string<ORTCHAR_T> dfn_make_ort_path(const gchar *path) {
         return std::basic_string<ORTCHAR_T>();
     }
     GError *error = nullptr;
-    gsize items = 0;
-    gunichar2 *utf16 = g_utf8_to_utf16(path, -1, nullptr, &items, &error);
+    glong items_written = 0;
+    gunichar2 *utf16 = g_utf8_to_utf16(path, -1, nullptr, &items_written, &error);
     if (!utf16) {
         if (error) {
             g_error_free(error);
         }
         return std::basic_string<ORTCHAR_T>();
     }
-    std::basic_string<ORTCHAR_T> out(reinterpret_cast<wchar_t *>(utf16), items);
+    size_t count = items_written > 0 ? static_cast<size_t>(items_written) : 0;
+    std::basic_string<ORTCHAR_T> out(reinterpret_cast<wchar_t *>(utf16), count);
     g_free(utf16);
     return out;
 #else
