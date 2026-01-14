@@ -267,22 +267,49 @@ UI shows:
 ## Runtime Knobs
 
 - `TCHAT_DISABLE_AEC=1` / `TCHAT_DISABLE_DFN=1`: force bypass.
+- `TCHAT_DISABLE_AGC=1`: disable WebRTC AGC (gain control).
+- `TCHAT_AGC_INPUT_VOLUME`: enable AGC input volume controller (0/1).
+- `TCHAT_AGC_HEADROOM_DB`: AGC headroom in dB (default 5).
+- `TCHAT_AGC_MAX_GAIN_DB`: AGC max gain in dB (default 50).
+- `TCHAT_AGC_INITIAL_GAIN_DB`: AGC initial gain in dB (default 15).
+- `TCHAT_AGC_MAX_NOISE_DBFS`: AGC max output noise level (default -50).
 - `TCHAT_AEC_AUTO_DELAY`: enable automatic AEC delay estimation (default 1).
 - `TCHAT_AEC_DELAY_MS`: AEC stream delay in ms (0-500).
+- `TCHAT_HPF_ENABLED`: enable high-pass filter (default 1).
+- `TCHAT_HPF_CUTOFF_HZ`: HPF cutoff (Hz, default 120).
 - `TCHAT_DFN_MIX`: DFN dry/wet mix (0.0-1.0).
 - `TCHAT_DFN_POST_FILTER`: DFN post filter strength (0.0-1.0).
+- `TCHAT_DFN_VAD_LINK`: link VAD to DFN mix (default 0).
+- `TCHAT_DFN_MIX_SPEECH`: DFN mix while speaking (default 0.85).
+- `TCHAT_DFN_MIX_SILENCE`: DFN mix while silent (default 1.0).
+- `TCHAT_DFN_MIX_SMOOTHING`: DFN mix smoothing (default 0.2).
+- `TCHAT_DFN_ALLOW_DEFAULT_OUTPUT`: allow fallback to `emb` when DFN3 output names mismatch (default 0).
+- `TCHAT_EQ_ENABLED`: enable 3-band EQ (default 0).
+- `TCHAT_EQ_LOW_DB` / `TCHAT_EQ_MID_DB` / `TCHAT_EQ_HIGH_DB`: EQ gains (dB).
+- `TCHAT_CNG_ENABLED`: enable comfort noise (default 1).
+- `TCHAT_CNG_LEVEL_DB`: comfort noise level in dBFS (default -65).
+- `TCHAT_CNG_FADE_MS`: comfort noise fade time (ms, default 20).
 - `TCHAT_LIMITER_THRESHOLD_DB`: limiter threshold in dB (default -1.0).
 - `TCHAT_LIMITER_ATTACK_MS` / `TCHAT_LIMITER_RELEASE_MS`: limiter time constants.
-- `TCHAT_OPUS_BITRATE`: Opus bitrate (bps, default 24000).
+- `TCHAT_OPUS_BITRATE`: Opus bitrate (bps, default 32000).
 - `TCHAT_OPUS_COMPLEXITY`: Opus complexity (0-10, default 10).
-- `TCHAT_OPUS_FEC`: enable Opus in-band FEC (0/1).
+- `TCHAT_OPUS_FEC`: enable Opus in-band FEC (0/1, default 1).
 - `TCHAT_OPUS_DTX`: enable Opus DTX (0/1).
-- `TCHAT_OPUS_PACKET_LOSS`: expected packet loss percentage for FEC tuning.
+- `TCHAT_OPUS_PACKET_LOSS`: expected packet loss percentage for FEC tuning (default 10).
+- `TCHAT_TARGET_SAMPLE_RATE`: target processing sample rate (Hz, default 48000).
 - `TCHAT_JITTER_LATENCY_MS`: base jitter buffer latency in ms (default 40).
+- `TCHAT_JITTER_MIN_MS` / `TCHAT_JITTER_MAX_MS`: clamp jitter buffer range.
+- `TCHAT_JITTER_SMOOTHING`: smoothing factor for jitter adaptation (default 0.95).
+- `TCHAT_JITTER_ADJUST_INTERVAL`: min seconds between jitter updates (default 3.0).
 - `TCHAT_SIGNAL_BIND`: signaling bind IP (default 0.0.0.0).
 - `TCHAT_SIGNAL_ALLOWLIST`: comma-separated IP allowlist (optional).
 - `TCHAT_SIGNAL_TOKEN`: shared signaling token (optional).
+- `TCHAT_SIGNAL_RCVBUF` / `TCHAT_SIGNAL_SNDBUF`: UDP buffer sizes in bytes.
+- `TCHAT_KEEPALIVE_INTERVAL`: keepalive send interval in seconds (default 1.0).
+- `TCHAT_KEEPALIVE_TIMEOUT`: timeout window for missing keepalive (default 6.0).
+- `TCHAT_KEEPALIVE_MAX_MISSES`: disconnect after N timeout windows (default 5).
 - `TCHAT_DEFAULT_LOCAL_PORT` / `TCHAT_DEFAULT_REMOTE_IP` / `TCHAT_DEFAULT_REMOTE_PORT`: UI defaults.
+- `TCHAT_GST_PLUGIN_PATH` / `TCHAT_HOMEBREW_GST_PATH`: extra GStreamer plugin paths.
 
 ## Packaging
 

@@ -37,6 +37,10 @@ struct _GstDeepFilterNet {
     double p50_ms;
     double p95_ms;
     std::vector<double> frame_times;
+    float auto_mix;
+    float auto_mix_target;
+    float auto_mix_smoothing;
+    gboolean auto_bypass;
     gchar *model_path;
     gchar *model_dir;
     gchar *input_name;
@@ -59,6 +63,7 @@ struct _GstDeepFilterNet {
     gboolean use_dfn3;
 
     gint sample_rate;
+    gboolean rate_supported;
     gint fft_size;
     gint hop_size;
     gint nb_erb;
@@ -88,6 +93,8 @@ struct _GstDeepFilterNet {
     std::vector<float> df_hist_real;
     std::vector<float> df_hist_imag;
     gint df_hist_filled;
+    gboolean warned_default_output;
+    gboolean allow_default_output;
 };
 
 G_DEFINE_TYPE(GstDeepFilterNet, gst_deepfilternet, GST_TYPE_ELEMENT)
@@ -107,13 +114,13 @@ static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE(
     "sink",
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS("audio/x-raw,format=F32LE,rate=48000,channels=1,layout=interleaved"));
+    GST_STATIC_CAPS("audio/x-raw,format=F32LE,rate=[8000,96000],channels=1,layout=interleaved"));
 
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
     "src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS("audio/x-raw,format=F32LE,rate=48000,channels=1,layout=interleaved"));
+    GST_STATIC_CAPS("audio/x-raw,format=F32LE,rate=[8000,96000],channels=1,layout=interleaved"));
 
 static double percentile(std::vector<double> values, double p) {
     if (values.empty()) {
@@ -286,6 +293,41 @@ static void dfn_prepare_buffers(GstDeepFilterNet *self) {
     self->frame_bytes = self->frame_samples * sizeof(float);
 }
 
+static void dfn_reset_state(GstDeepFilterNet *self) {
+    std::fill(self->time_buffer.begin(), self->time_buffer.end(), 0.0f);
+    std::fill(self->fft_in.begin(), self->fft_in.end(), 0.0f);
+    std::fill(self->ifft_out.begin(), self->ifft_out.end(), 0.0f);
+    std::fill(self->ola_buffer.begin(), self->ola_buffer.end(), 0.0f);
+    std::fill(self->spectrum.begin(), self->spectrum.end(), GstFFTF32Complex{0.0f, 0.0f});
+    std::fill(self->magnitude.begin(), self->magnitude.end(), 0.0f);
+    std::fill(self->mask_bins.begin(), self->mask_bins.end(), 1.0f);
+    std::fill(self->feat_erb.begin(), self->feat_erb.end(), 0.0f);
+    std::fill(self->feat_spec.begin(), self->feat_spec.end(), 0.0f);
+    std::fill(self->mask_erb.begin(), self->mask_erb.end(), 1.0f);
+    std::fill(self->df_coefs.begin(), self->df_coefs.end(), 0.0f);
+    std::fill(self->df_cur_real.begin(), self->df_cur_real.end(), 0.0f);
+    std::fill(self->df_cur_imag.begin(), self->df_cur_imag.end(), 0.0f);
+    std::fill(self->df_hist_real.begin(), self->df_hist_real.end(), 0.0f);
+    std::fill(self->df_hist_imag.begin(), self->df_hist_imag.end(), 0.0f);
+    self->df_hist_filled = 0;
+    self->post_filter_state = 0.0f;
+    self->consecutive_over = 0;
+    self->cooldown_until = 0;
+    self->bypass_count = 0;
+    self->auto_mix = 1.0f;
+    self->auto_mix_target = 1.0f;
+    self->auto_bypass = FALSE;
+    self->auto_mix = 1.0f;
+    self->auto_mix_target = 1.0f;
+    self->auto_mix_smoothing = 0.2f;
+    self->auto_bypass = FALSE;
+    self->frame_counter = 0;
+    self->p50_ms = 0.0;
+    self->p95_ms = 0.0;
+    self->frame_times.clear();
+    self->warned_default_output = FALSE;
+}
+
 static gboolean dfn_init_ort(GstDeepFilterNet *self) {
     if (!self->ort) {
         self->ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
@@ -299,8 +341,8 @@ static gboolean dfn_init_ort(GstDeepFilterNet *self) {
         if (!ort_ok(self, self->ort->CreateSessionOptions(&self->session_opts), "CreateSessionOptions")) {
             return FALSE;
         }
-        self->ort->SetIntraOpNumThreads(self->session_opts, 1);
-        self->ort->SetInterOpNumThreads(self->session_opts, 1);
+        ort_ok(self, self->ort->SetIntraOpNumThreads(self->session_opts, 1), "SetIntraOpNumThreads");
+        ort_ok(self, self->ort->SetInterOpNumThreads(self->session_opts, 1), "SetInterOpNumThreads");
     }
     if (!self->mem_info) {
         if (!ort_ok(self, self->ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &self->mem_info), "CreateCpuMemoryInfo")) {
@@ -347,16 +389,19 @@ static gboolean dfn_init_single_session(GstDeepFilterNet *self) {
 
     if (!self->input_name || !self->output_name) {
         OrtAllocator *allocator = nullptr;
-        self->ort->GetAllocatorWithDefaultOptions(&allocator);
-        if (!self->input_name) {
-            char *name = nullptr;
-            self->ort->SessionGetInputName(self->single_session, 0, allocator, &name);
-            self->input_name = dfn_strdup_ort_name(self, allocator, name);
-        }
-        if (!self->output_name) {
-            char *name = nullptr;
-            self->ort->SessionGetOutputName(self->single_session, 0, allocator, &name);
-            self->output_name = dfn_strdup_ort_name(self, allocator, name);
+        if (ort_ok(self, self->ort->GetAllocatorWithDefaultOptions(&allocator), "GetAllocatorWithDefaultOptions") && allocator) {
+            if (!self->input_name) {
+                char *name = nullptr;
+                if (ort_ok(self, self->ort->SessionGetInputName(self->single_session, 0, allocator, &name), "SessionGetInputName single")) {
+                    self->input_name = dfn_strdup_ort_name(self, allocator, name);
+                }
+            }
+            if (!self->output_name) {
+                char *name = nullptr;
+                if (ort_ok(self, self->ort->SessionGetOutputName(self->single_session, 0, allocator, &name), "SessionGetOutputName single")) {
+                    self->output_name = dfn_strdup_ort_name(self, allocator, name);
+                }
+            }
         }
     }
     return TRUE;
@@ -429,7 +474,10 @@ static gboolean dfn_init_dfn3_session(GstDeepFilterNet *self) {
     }
 
     OrtAllocator *allocator = nullptr;
-    self->ort->GetAllocatorWithDefaultOptions(&allocator);
+    if (!ort_ok(self, self->ort->GetAllocatorWithDefaultOptions(&allocator), "GetAllocatorWithDefaultOptions") || !allocator) {
+        GST_WARNING_OBJECT(self, "GetAllocatorWithDefaultOptions failed");
+        return FALSE;
+    }
 
     dfn_free_name_array(self->enc_input_names, 2);
     dfn_free_name_array(self->enc_output_names, 7);
@@ -438,35 +486,82 @@ static gboolean dfn_init_dfn3_session(GstDeepFilterNet *self) {
     dfn_free_name_array(self->df_input_names, 2);
     dfn_free_name_array(self->df_output_names, 2);
 
-    for (size_t i = 0; i < 2; ++i) {
+    gboolean names_ok = TRUE;
+    for (size_t i = 0; i < 2 && names_ok; ++i) {
         char *name = nullptr;
-        self->ort->SessionGetInputName(self->enc_session, i, allocator, &name);
+        if (!ort_ok(self, self->ort->SessionGetInputName(self->enc_session, i, allocator, &name), "SessionGetInputName enc") || !name) {
+            names_ok = FALSE;
+            break;
+        }
         self->enc_input_names[i] = dfn_strdup_ort_name(self, allocator, name);
+        if (!self->enc_input_names[i]) {
+            names_ok = FALSE;
+        }
     }
-    for (size_t i = 0; i < 7; ++i) {
+    for (size_t i = 0; i < 7 && names_ok; ++i) {
         char *name = nullptr;
-        self->ort->SessionGetOutputName(self->enc_session, i, allocator, &name);
+        if (!ort_ok(self, self->ort->SessionGetOutputName(self->enc_session, i, allocator, &name), "SessionGetOutputName enc") || !name) {
+            names_ok = FALSE;
+            break;
+        }
         self->enc_output_names[i] = dfn_strdup_ort_name(self, allocator, name);
+        if (!self->enc_output_names[i]) {
+            names_ok = FALSE;
+        }
     }
-    for (size_t i = 0; i < 5; ++i) {
+    for (size_t i = 0; i < 5 && names_ok; ++i) {
         char *name = nullptr;
-        self->ort->SessionGetInputName(self->erb_session, i, allocator, &name);
+        if (!ort_ok(self, self->ort->SessionGetInputName(self->erb_session, i, allocator, &name), "SessionGetInputName erb") || !name) {
+            names_ok = FALSE;
+            break;
+        }
         self->erb_input_names[i] = dfn_strdup_ort_name(self, allocator, name);
+        if (!self->erb_input_names[i]) {
+            names_ok = FALSE;
+        }
     }
-    for (size_t i = 0; i < 1; ++i) {
+    for (size_t i = 0; i < 1 && names_ok; ++i) {
         char *name = nullptr;
-        self->ort->SessionGetOutputName(self->erb_session, i, allocator, &name);
+        if (!ort_ok(self, self->ort->SessionGetOutputName(self->erb_session, i, allocator, &name), "SessionGetOutputName erb") || !name) {
+            names_ok = FALSE;
+            break;
+        }
         self->erb_output_names[i] = dfn_strdup_ort_name(self, allocator, name);
+        if (!self->erb_output_names[i]) {
+            names_ok = FALSE;
+        }
     }
-    for (size_t i = 0; i < 2; ++i) {
+    for (size_t i = 0; i < 2 && names_ok; ++i) {
         char *name = nullptr;
-        self->ort->SessionGetInputName(self->df_session, i, allocator, &name);
+        if (!ort_ok(self, self->ort->SessionGetInputName(self->df_session, i, allocator, &name), "SessionGetInputName df") || !name) {
+            names_ok = FALSE;
+            break;
+        }
         self->df_input_names[i] = dfn_strdup_ort_name(self, allocator, name);
+        if (!self->df_input_names[i]) {
+            names_ok = FALSE;
+        }
     }
-    for (size_t i = 0; i < 2; ++i) {
+    for (size_t i = 0; i < 2 && names_ok; ++i) {
         char *name = nullptr;
-        self->ort->SessionGetOutputName(self->df_session, i, allocator, &name);
+        if (!ort_ok(self, self->ort->SessionGetOutputName(self->df_session, i, allocator, &name), "SessionGetOutputName df") || !name) {
+            names_ok = FALSE;
+            break;
+        }
         self->df_output_names[i] = dfn_strdup_ort_name(self, allocator, name);
+        if (!self->df_output_names[i]) {
+            names_ok = FALSE;
+        }
+    }
+
+    if (!names_ok) {
+        dfn_free_name_array(self->enc_input_names, 2);
+        dfn_free_name_array(self->enc_output_names, 7);
+        dfn_free_name_array(self->erb_input_names, 5);
+        dfn_free_name_array(self->erb_output_names, 1);
+        dfn_free_name_array(self->df_input_names, 2);
+        dfn_free_name_array(self->df_output_names, 2);
+        return FALSE;
     }
 
     return TRUE;
@@ -534,6 +629,10 @@ static OrtValue *dfn_pick_enc_output(GstDeepFilterNet *self, const gchar *name, 
     if (g_strcmp0(name, "c0") == 0) {
         return enc_outputs[5];
     }
+    if (!self->warned_default_output) {
+        GST_WARNING_OBJECT(self, "Unknown encoder output '%s'; defaulting to 'emb'", name ? name : "(null)");
+        self->warned_default_output = TRUE;
+    }
     return nullptr;
 }
 
@@ -543,7 +642,10 @@ static size_t dfn_tensor_len(GstDeepFilterNet *self, const OrtValue *value) {
     if (!ort_ok(self, self->ort->GetTensorTypeAndShape(value, &shape), "GetTensorTypeAndShape")) {
         return 0;
     }
-    self->ort->GetTensorShapeElementCount(shape, &count);
+    if (!ort_ok(self, self->ort->GetTensorShapeElementCount(shape, &count), "GetTensorShapeElementCount")) {
+        self->ort->ReleaseTensorTypeAndShapeInfo(shape);
+        return 0;
+    }
     self->ort->ReleaseTensorTypeAndShapeInfo(shape);
     return count;
 }
@@ -570,10 +672,15 @@ static gboolean dfn_run_single(GstDeepFilterNet *self, const float *in, float *o
     const char *output_names[] = {self->output_name ? self->output_name : "output"};
     if (!ort_ok(self, self->ort->Run(self->single_session, nullptr, input_names, (const OrtValue *const *)&input_tensor, 1, output_names, 1, &output_tensor), "Run single")) {
         self->ort->ReleaseValue(input_tensor);
+        if (output_tensor) {
+            self->ort->ReleaseValue(output_tensor);
+        }
         return FALSE;
     }
     float *out_data = nullptr;
-    self->ort->GetTensorMutableData(output_tensor, reinterpret_cast<void **>(&out_data));
+    if (!ort_ok(self, self->ort->GetTensorMutableData(output_tensor, reinterpret_cast<void **>(&out_data)), "GetTensorMutableData single")) {
+        out_data = nullptr;
+    }
     if (out_data) {
         memcpy(out, out_data, self->frame_bytes);
     } else {
@@ -675,7 +782,17 @@ static gboolean dfn_run_dfn3(GstDeepFilterNet *self, const float *in, float *out
     for (gint i = 0; i < 5; ++i) {
         OrtValue *val = dfn_pick_enc_output(self, erb_input_names[i], enc_outputs);
         if (!val) {
-            val = enc_outputs[4];
+            if (self->allow_default_output) {
+                val = enc_outputs[4];
+            } else {
+                for (gint j = 0; j < 2; ++j) {
+                    self->ort->ReleaseValue(enc_inputs[j]);
+                }
+                for (gint j = 0; j < 7; ++j) {
+                    self->ort->ReleaseValue(enc_outputs[j]);
+                }
+                return FALSE;
+            }
         }
         erb_inputs[i] = val;
     }
@@ -696,7 +813,18 @@ static gboolean dfn_run_dfn3(GstDeepFilterNet *self, const float *in, float *out
     for (gint i = 0; i < 2; ++i) {
         OrtValue *val = dfn_pick_enc_output(self, df_input_names[i], enc_outputs);
         if (!val) {
-            val = enc_outputs[4];
+            if (self->allow_default_output) {
+                val = enc_outputs[4];
+            } else {
+                for (gint j = 0; j < 2; ++j) {
+                    self->ort->ReleaseValue(enc_inputs[j]);
+                }
+                for (gint j = 0; j < 7; ++j) {
+                    self->ort->ReleaseValue(enc_outputs[j]);
+                }
+                self->ort->ReleaseValue(erb_outputs[0]);
+                return FALSE;
+            }
         }
         df_inputs[i] = val;
     }
@@ -714,7 +842,9 @@ static gboolean dfn_run_dfn3(GstDeepFilterNet *self, const float *in, float *out
     }
 
     float *mask_data = nullptr;
-    self->ort->GetTensorMutableData(erb_outputs[0], reinterpret_cast<void **>(&mask_data));
+    if (!ort_ok(self, self->ort->GetTensorMutableData(erb_outputs[0], reinterpret_cast<void **>(&mask_data)), "GetTensorMutableData erb")) {
+        mask_data = nullptr;
+    }
     size_t mask_len = dfn_tensor_len(self, erb_outputs[0]);
     if (mask_data && mask_len >= static_cast<size_t>(self->nb_erb)) {
         memcpy(self->mask_erb.data(), mask_data, self->nb_erb * sizeof(float));
@@ -726,7 +856,9 @@ static gboolean dfn_run_dfn3(GstDeepFilterNet *self, const float *in, float *out
     for (gint i = 0; i < 2; ++i) {
         if (g_strcmp0(df_output_names[i], "coefs") == 0) {
             float *coef_data = nullptr;
-            self->ort->GetTensorMutableData(df_outputs[i], reinterpret_cast<void **>(&coef_data));
+            if (!ort_ok(self, self->ort->GetTensorMutableData(df_outputs[i], reinterpret_cast<void **>(&coef_data)), "GetTensorMutableData df")) {
+                coef_data = nullptr;
+            }
             coef_len = dfn_tensor_len(self, df_outputs[i]);
             if (coef_data && coef_len > 0) {
                 size_t expected = static_cast<size_t>(self->nb_df * self->df_order * 2);
@@ -845,7 +977,9 @@ static GstFlowReturn dfn_process_frame(GstDeepFilterNet *self, GstBuffer *inbuf)
     gboolean bypass = self->bypass;
     gint64 now_us = g_get_monotonic_time();
     if (self->cooldown_until > now_us) {
-        bypass = TRUE;
+        self->auto_mix_target = 0.0f;
+    } else {
+        self->auto_mix_target = 1.0f;
     }
 
     double elapsed_ms = 0.0;
@@ -861,32 +995,42 @@ static GstFlowReturn dfn_process_frame(GstDeepFilterNet *self, GstBuffer *inbuf)
         elapsed_ms = (end_us - start_us) / 1000.0;
     }
 
-    if (!ok) {
-        memcpy(out, in, self->frame_bytes);
-        bypass = TRUE;
-    }
-
-    if (elapsed_ms > 8.0) {
-        bypass = TRUE;
+    const double frame_ms = (1000.0 * self->frame_samples) / static_cast<double>(self->sample_rate);
+    const double timeout_ms = std::max(8.0, frame_ms * 0.9);
+    if (elapsed_ms > timeout_ms) {
         self->consecutive_over += 1;
         if (self->consecutive_over >= 3) {
             self->cooldown_until = g_get_monotonic_time() + 2000000;
             self->consecutive_over = 0;
+            self->auto_mix_target = 0.0f;
         }
     } else {
         self->consecutive_over = 0;
     }
 
-    if (bypass) {
+    if (!ok || bypass) {
         memcpy(out, in, self->frame_bytes);
+        if (!ok) {
+            self->auto_mix_target = 0.0f;
+        }
         self->bypass_count += 1;
     }
 
-    if (!bypass && self->mix < 0.999) {
-        double wet = self->mix;
-        double dry = 1.0 - wet;
-        for (guint i = 0; i < self->frame_samples; ++i) {
-            out[i] = static_cast<float>((out[i] * wet) + (in[i] * dry));
+    self->auto_mix += (self->auto_mix_target - self->auto_mix) * self->auto_mix_smoothing;
+    if (self->auto_mix < 0.0f) {
+        self->auto_mix = 0.0f;
+    } else if (self->auto_mix > 1.0f) {
+        self->auto_mix = 1.0f;
+    }
+    self->auto_bypass = self->auto_mix < 0.05f;
+
+    if (!bypass && ok) {
+        double wet = self->mix * self->auto_mix;
+        if (wet < 0.999) {
+            double dry = 1.0 - wet;
+            for (guint i = 0; i < self->frame_samples; ++i) {
+                out[i] = static_cast<float>((out[i] * wet) + (in[i] * dry));
+            }
         }
     }
 
@@ -899,11 +1043,8 @@ static GstFlowReturn dfn_process_frame(GstDeepFilterNet *self, GstBuffer *inbuf)
     }
 
     for (guint i = 0; i < self->frame_samples; ++i) {
-        if (out[i] > 0.98f) {
-            out[i] = 0.98f;
-        } else if (out[i] < -0.98f) {
-            out[i] = -0.98f;
-        }
+        float x = out[i];
+        out[i] = 0.98f * tanhf(x / 0.98f);
     }
 
     if (elapsed_ms > 0.0) {
@@ -927,6 +1068,12 @@ static GstFlowReturn dfn_process_frame(GstDeepFilterNet *self, GstBuffer *inbuf)
             "bypass_count",
             G_TYPE_UINT64,
             self->bypass_count,
+            "auto_mix",
+            G_TYPE_DOUBLE,
+            self->auto_mix,
+            "auto_bypass",
+            G_TYPE_BOOLEAN,
+            self->auto_bypass,
             nullptr);
         gst_element_post_message(GST_ELEMENT(self), gst_message_new_element(GST_OBJECT(self), s));
     }
@@ -934,7 +1081,7 @@ static GstFlowReturn dfn_process_frame(GstDeepFilterNet *self, GstBuffer *inbuf)
     GstClockTime pts = GST_BUFFER_PTS(inbuf);
     GstClockTime dur = GST_BUFFER_DURATION(inbuf);
     if (dur == GST_CLOCK_TIME_NONE) {
-        dur = gst_util_uint64_scale_int(GST_SECOND, self->frame_samples, 48000);
+        dur = gst_util_uint64_scale_int(GST_SECOND, self->frame_samples, self->sample_rate);
     }
     GST_BUFFER_PTS(outbuf) = pts;
     GST_BUFFER_DURATION(outbuf) = dur;
@@ -961,6 +1108,29 @@ static GstFlowReturn gst_deepfilternet_chain(GstPad *pad, GstObject *parent, Gst
 
 static gboolean gst_deepfilternet_sink_event(GstPad *pad, GstObject *parent, GstEvent *event) {
     GstDeepFilterNet *self = GST_DEEPFILTERNET(parent);
+    if (GST_EVENT_TYPE(event) == GST_EVENT_CAPS) {
+        GstCaps *caps = nullptr;
+        gst_event_parse_caps(event, &caps);
+        if (caps) {
+            const GstStructure *s = gst_caps_get_structure(caps, 0);
+            gint rate = 0;
+            if (gst_structure_get_int(s, "rate", &rate) && rate > 0) {
+                if (rate != self->sample_rate) {
+                    self->sample_rate = rate;
+                    self->frame_samples = static_cast<guint>(std::max(1, rate / 100));
+                    self->frame_bytes = self->frame_samples * sizeof(float);
+                    gst_adapter_clear(self->adapter);
+                }
+                if (rate != 48000) {
+                    self->rate_supported = FALSE;
+                    self->bypass = TRUE;
+                    GST_WARNING_OBJECT(self, "DFN expects 48kHz input, got %d Hz; bypassing", rate);
+                } else {
+                    self->rate_supported = TRUE;
+                }
+            }
+        }
+    }
     GstEvent *forward = gst_event_ref(event);
     gboolean ret = gst_pad_event_default(pad, parent, event);
     if (ret && self->srcpad) {
@@ -1082,6 +1252,9 @@ static GstStateChangeReturn gst_deepfilternet_change_state(GstElement *element, 
         if (!dfn_init_session(self)) {
             self->bypass = TRUE;
         }
+        dfn_reset_state(self);
+    } else if (transition == GST_STATE_CHANGE_PAUSED_TO_READY) {
+        dfn_reset_state(self);
     }
     return GST_ELEMENT_CLASS(gst_deepfilternet_parent_class)->change_state(element, transition);
 }
@@ -1164,6 +1337,17 @@ static void gst_deepfilternet_init(GstDeepFilterNet *self) {
     self->use_dfn3 = FALSE;
     self->fft = nullptr;
     self->ifft = nullptr;
+    self->warned_default_output = FALSE;
+    self->rate_supported = TRUE;
+    const gchar *allow_default = g_getenv("TCHAT_DFN_ALLOW_DEFAULT_OUTPUT");
+    if (allow_default && *allow_default) {
+        self->allow_default_output = !(g_ascii_strcasecmp(allow_default, "0") == 0 ||
+                                       g_ascii_strcasecmp(allow_default, "false") == 0 ||
+                                       g_ascii_strcasecmp(allow_default, "no") == 0 ||
+                                       g_ascii_strcasecmp(allow_default, "off") == 0);
+    } else {
+        self->allow_default_output = FALSE;
+    }
     dfn_apply_default_config(self);
 
     for (gint i = 0; i < 2; ++i) {

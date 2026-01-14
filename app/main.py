@@ -17,9 +17,26 @@ def parse_args():
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CUSTOM_PLUGINS_DIR = os.path.join(ROOT_DIR, "native", "build", "gst-plugins")
-HOMEBREW_PLUGINS_DIR = "/opt/homebrew/lib/gstreamer-1.0"
+BREW_PREFIX = os.getenv("HOMEBREW_PREFIX", "/opt/homebrew")
+BREW_PLUGINS_DIR = os.getenv("TCHAT_HOMEBREW_GST_PATH", os.path.join(BREW_PREFIX, "lib", "gstreamer-1.0"))
+LEGACY_BREW_PLUGINS_DIR = "/usr/local/lib/gstreamer-1.0"
+EXTRA_GST_PATH = os.getenv("TCHAT_GST_PLUGIN_PATH")
 
-os.environ["GST_PLUGIN_PATH"] = f"{CUSTOM_PLUGINS_DIR}:{HOMEBREW_PLUGINS_DIR}"
+plugin_paths = [CUSTOM_PLUGINS_DIR]
+extra_candidates = []
+if EXTRA_GST_PATH:
+    extra_candidates.extend([p for p in EXTRA_GST_PATH.split(os.pathsep) if p])
+for candidate in (BREW_PLUGINS_DIR, LEGACY_BREW_PLUGINS_DIR, *extra_candidates):
+    if candidate and os.path.isdir(candidate):
+        plugin_paths.append(candidate)
+existing = os.getenv("GST_PLUGIN_PATH")
+if existing:
+    plugin_paths.append(existing)
+unique_paths = []
+for path in plugin_paths:
+    if path and path not in unique_paths:
+        unique_paths.append(path)
+os.environ["GST_PLUGIN_PATH"] = ":".join(unique_paths)
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -72,7 +89,7 @@ def main():
 
     def handle_sigint(signum, frame):
         print("\nReceived Ctrl+C, shutting down gracefully...")
-        QtWidgets.QApplication.quit()
+        QtCore.QTimer.singleShot(0, QtWidgets.QApplication.quit)
 
     signal.signal(signal.SIGINT, handle_sigint)
 

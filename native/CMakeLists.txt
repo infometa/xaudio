@@ -183,6 +183,9 @@ if (WEBRTC_LIB_DIR AND WEBRTC_LIBS STREQUAL "")
         endif()
     endif()
 endif()
+if (WEBRTC_LIBS)
+    list(REMOVE_DUPLICATES WEBRTC_LIBS)
+endif()
 
 if (NOT ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_ROOT)
     if (EXISTS "${ONNXRUNTIME_ROOT}/include/onnxruntime_c_api.h")
@@ -211,6 +214,9 @@ add_library(gstwebrtcaec3 SHARED
 
 target_include_directories(gstwebrtcaec3 PRIVATE ${GST_INCLUDE_DIRS})
 target_link_libraries(gstwebrtcaec3 PRIVATE ${GST_LIBRARIES} ${WEBRTC_LIBS})
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(gstwebrtcaec3 PRIVATE -Wno-nullability-completeness)
+endif()
 if (WEBRTC_LIB_DIR)
     file(GLOB_RECURSE WEBRTC_ABSL_OBJS
         "${WEBRTC_LIB_ROOT}/third_party/abseil-cpp/absl/**/*.o"

@@ -19,12 +19,20 @@ class MediaEngine:
         self.aec = None
         self.dfn = None
         self.limiter = None
+        self.opusenc = None
         self.send_valve = None
         self.jitter = None
         self.jitter_latency_ms_default = self._env_int("TCHAT_JITTER_LATENCY_MS", 40)
         self.jitter_latency_ms = self.jitter_latency_ms_default
         self._last_jitter_adjust_ts = 0.0
+        self.jitter_min_ms = self._env_int("TCHAT_JITTER_MIN_MS", 20)
+        self.jitter_max_ms = self._env_int("TCHAT_JITTER_MAX_MS", 200)
+        if self.jitter_min_ms > self.jitter_max_ms:
+            self.jitter_min_ms, self.jitter_max_ms = self.jitter_max_ms, self.jitter_min_ms
+        self.jitter_smoothing = self._clamp(self._env_float("TCHAT_JITTER_SMOOTHING", 0.95), 0.5, 0.98)
+        self.jitter_adjust_interval = max(0.2, self._env_float("TCHAT_JITTER_ADJUST_INTERVAL", 3.0))
         self.queues = {}
+        self.queue_overruns = {}
         self.clock = None
         self.base_time = None
         self.vad_sample_count = 0
@@ -36,25 +44,68 @@ class MediaEngine:
         self.last_output_device = None
         self.audio_src = None
         self.audio_sink = None
+        self.target_sample_rate = self._env_int("TCHAT_TARGET_SAMPLE_RATE", 48000)
+        self.input_sample_rate = None
+        self.hpf = None
+        self.hpf_enabled = self._env_flag_default("TCHAT_HPF_ENABLED", True)
+        self.hpf_cutoff_hz = self._env_int("TCHAT_HPF_CUTOFF_HZ", 120)
+        self.hpf_active = None
+        self.eq = None
+        self.eq_enabled = self._env_flag_default("TCHAT_EQ_ENABLED", False)
+        self.eq_low_gain_db = self._env_float("TCHAT_EQ_LOW_DB", 0.0)
+        self.eq_mid_gain_db = self._env_float("TCHAT_EQ_MID_DB", 0.0)
+        self.eq_high_gain_db = self._env_float("TCHAT_EQ_HIGH_DB", 0.0)
+        self.eq_active = None
+        self.cng_enabled = self._env_flag_default("TCHAT_CNG_ENABLED", True)
+        self.cng_level_db = self._env_float("TCHAT_CNG_LEVEL_DB", -65.0)
+        self.cng_fade_ms = self._env_int("TCHAT_CNG_FADE_MS", 20)
+        self.cng_mixer = None
+        self.cng_src = None
+        self.cng_volume = None
+        self.cng_valve = None
+        self.cng_conv = None
+        self.cng_res = None
+        self.cng_caps = None
+        self.cng_active = None
+        self.cng_current_level = 0.0
+        self.cng_target_level = 0.0
+        self.cng_last_update = 0.0
         self.disable_aec_env = self._env_flag("TCHAT_DISABLE_AEC")
         self.disable_dfn_env = self._env_flag("TCHAT_DISABLE_DFN")
+        self.disable_agc_env = self._env_flag("TCHAT_DISABLE_AGC")
         self.aec_enabled = not self.disable_aec_env
         self.dfn_enabled = not self.disable_dfn_env
+        self.agc_enabled = not self.disable_agc_env
+        self.agc_input_volume = self._env_flag_default("TCHAT_AGC_INPUT_VOLUME", False)
+        self.agc_headroom_db = self._env_float("TCHAT_AGC_HEADROOM_DB", 5.0)
+        self.agc_max_gain_db = self._env_float("TCHAT_AGC_MAX_GAIN_DB", 50.0)
+        self.agc_initial_gain_db = self._env_float("TCHAT_AGC_INITIAL_GAIN_DB", 15.0)
+        self.agc_max_noise_dbfs = self._env_float("TCHAT_AGC_MAX_NOISE_DBFS", -50.0)
         self.aec_auto_delay = self._env_flag_default("TCHAT_AEC_AUTO_DELAY", True)
         self.aec_delay_ms = self._env_int("TCHAT_AEC_DELAY_MS", 0)
         self.dfn_mix = self._env_float("TCHAT_DFN_MIX", 1.0)
         self.dfn_post_filter = self._env_float("TCHAT_DFN_POST_FILTER", 0.0)
+        self.dfn_vad_link = self._env_flag_default("TCHAT_DFN_VAD_LINK", False)
+        self.dfn_mix_speech = self._env_float("TCHAT_DFN_MIX_SPEECH", 0.85)
+        self.dfn_mix_silence = self._env_float("TCHAT_DFN_MIX_SILENCE", 1.0)
+        self.dfn_mix_smoothing = self._env_float("TCHAT_DFN_MIX_SMOOTHING", 0.2)
+        self.dfn_auto_mix = 1.0
+        self.dfn_auto_bypass = False
         self.limiter_threshold_db = self._env_float("TCHAT_LIMITER_THRESHOLD_DB", -1.0)
         self.limiter_attack_ms = self._env_float("TCHAT_LIMITER_ATTACK_MS", 5.0)
         self.limiter_release_ms = self._env_float("TCHAT_LIMITER_RELEASE_MS", 50.0)
-        self.opus_bitrate = self._env_int("TCHAT_OPUS_BITRATE", 24000)
-        self.opus_packet_loss = self._env_int("TCHAT_OPUS_PACKET_LOSS", 0)
-        self.opus_fec = self._env_flag("TCHAT_OPUS_FEC")
+        self.opus_bitrate = self._env_int("TCHAT_OPUS_BITRATE", 32000)
+        self.opus_packet_loss = self._env_int("TCHAT_OPUS_PACKET_LOSS", 10)
+        self.opus_fec = self._env_flag_default("TCHAT_OPUS_FEC", True)
         self.opus_dtx = self._env_flag("TCHAT_OPUS_DTX")
         self.opus_complexity = self._env_int("TCHAT_OPUS_COMPLEXITY", 10)
         self.aec_active = None
         self.dfn_active = None
+        self.limiter_active = None
         self.send_enabled = True
+        self.on_error = None
+        self.last_error = None
+        self._handling_error = False
 
     def list_devices(self):
         sources = []
@@ -114,23 +165,59 @@ class MediaEngine:
 
         try:
             self.metrics.clear_runtime()
+            self.last_error = None
             disable_aec = self._env_flag("TCHAT_DISABLE_AEC")
             disable_dfn = self._env_flag("TCHAT_DISABLE_DFN")
+            disable_agc = self._env_flag("TCHAT_DISABLE_AGC")
+            self.target_sample_rate = self._env_int("TCHAT_TARGET_SAMPLE_RATE", self.target_sample_rate)
+            self.hpf_enabled = self._env_flag_default("TCHAT_HPF_ENABLED", self.hpf_enabled)
+            self.hpf_cutoff_hz = self._env_int("TCHAT_HPF_CUTOFF_HZ", self.hpf_cutoff_hz)
+            self.eq_enabled = self._env_flag_default("TCHAT_EQ_ENABLED", self.eq_enabled)
+            self.eq_low_gain_db = self._env_float("TCHAT_EQ_LOW_DB", self.eq_low_gain_db)
+            self.eq_mid_gain_db = self._env_float("TCHAT_EQ_MID_DB", self.eq_mid_gain_db)
+            self.eq_high_gain_db = self._env_float("TCHAT_EQ_HIGH_DB", self.eq_high_gain_db)
+            self.cng_enabled = self._env_flag_default("TCHAT_CNG_ENABLED", self.cng_enabled)
+            self.cng_level_db = self._env_float("TCHAT_CNG_LEVEL_DB", self.cng_level_db)
+            self.cng_fade_ms = self._env_int("TCHAT_CNG_FADE_MS", self.cng_fade_ms)
+            self.dfn_vad_link = self._env_flag_default("TCHAT_DFN_VAD_LINK", self.dfn_vad_link)
+            self.dfn_mix_speech = self._env_float("TCHAT_DFN_MIX_SPEECH", self.dfn_mix_speech)
+            self.dfn_mix_silence = self._env_float("TCHAT_DFN_MIX_SILENCE", self.dfn_mix_silence)
+            self.dfn_mix_smoothing = self._env_float("TCHAT_DFN_MIX_SMOOTHING", self.dfn_mix_smoothing)
+            self.opus_bitrate = self._env_int("TCHAT_OPUS_BITRATE", self.opus_bitrate)
+            self.opus_packet_loss = self._env_int("TCHAT_OPUS_PACKET_LOSS", self.opus_packet_loss)
+            self.opus_fec = self._env_flag_default("TCHAT_OPUS_FEC", self.opus_fec)
+            self.opus_dtx = self._env_flag("TCHAT_OPUS_DTX")
+            self.agc_input_volume = self._env_flag_default("TCHAT_AGC_INPUT_VOLUME", self.agc_input_volume)
+            self.agc_headroom_db = self._env_float("TCHAT_AGC_HEADROOM_DB", self.agc_headroom_db)
+            self.agc_max_gain_db = self._env_float("TCHAT_AGC_MAX_GAIN_DB", self.agc_max_gain_db)
+            self.agc_initial_gain_db = self._env_float("TCHAT_AGC_INITIAL_GAIN_DB", self.agc_initial_gain_db)
+            self.agc_max_noise_dbfs = self._env_float("TCHAT_AGC_MAX_NOISE_DBFS", self.agc_max_noise_dbfs)
+            if self.target_sample_rate < 8000 or self.target_sample_rate > 96000:
+                self.logger.warning("Invalid target sample rate %s, using 48000", self.target_sample_rate)
+                self.target_sample_rate = 48000
             self.disable_aec_env = disable_aec
             self.disable_dfn_env = disable_dfn
+            self.disable_agc_env = disable_agc
             if disable_aec:
                 self.aec_enabled = False
+                self.agc_enabled = False
             if disable_dfn:
                 self.dfn_enabled = False
+            if disable_agc:
+                self.agc_enabled = False
             self.is_listen_only = remote_ip is None or remote_port is None
             self.last_local_port = local_port
             self.last_input_device = input_device
             self.last_output_device = output_device
             self.logger.info("Media mode: %s", "listen-only" if self.is_listen_only else "full-duplex")
+            if self.is_listen_only:
+                self.cng_enabled = False
             if disable_aec:
                 self.logger.info("AEC disabled via TCHAT_DISABLE_AEC")
             if disable_dfn:
                 self.logger.info("DFN disabled via TCHAT_DISABLE_DFN")
+            if disable_agc:
+                self.logger.info("AGC disabled via TCHAT_DISABLE_AGC")
 
             src = self._make_audio_src(input_device)
             self.audio_src = src
@@ -142,13 +229,16 @@ class MediaEngine:
 
             audconv1 = Gst.ElementFactory.make("audioconvert", "audconv1")
             audres1 = Gst.ElementFactory.make("audioresample", "audres1")
+            self._set_if_prop(audres1, "quality", 10)
             caps1 = Gst.ElementFactory.make("capsfilter", "caps1")
             caps1.set_property(
                 "caps",
-                Gst.Caps.from_string("audio/x-raw,format=F32LE,rate=48000,channels=1,layout=interleaved"),
+                Gst.Caps.from_string(f"audio/x-raw,format=F32LE,rate={self.target_sample_rate},channels=1,layout=interleaved"),
             )
+            self.hpf = self._make_hpf()
+            self.hpf_active = bool(self.hpf and self.hpf.get_factory().get_name() != "identity")
 
-            capture_q = self._make_queue("capture_q", max_buffers=10, leaky=True)
+            capture_q = self._make_queue("capture_q", max_buffers=10, leaky=False)
             
             if disable_aec:
                 self.aec = None
@@ -163,14 +253,35 @@ class MediaEngine:
                 self.aec.set_property("stream-delay-ms", int(self.aec_delay_ms))
             if self.aec and self.aec.find_property("auto-delay"):
                 self.aec.set_property("auto-delay", bool(self.aec_auto_delay))
+            if self.aec and self.aec.find_property("agc"):
+                self.aec.set_property("agc", bool(self.agc_enabled))
+            if self.aec and self.aec.find_property("agc-input-volume"):
+                self.aec.set_property("agc-input-volume", bool(self.agc_input_volume))
+            if self.aec and self.aec.find_property("agc-headroom-db"):
+                self.aec.set_property("agc-headroom-db", float(self.agc_headroom_db))
+            if self.aec and self.aec.find_property("agc-max-gain-db"):
+                self.aec.set_property("agc-max-gain-db", float(self.agc_max_gain_db))
+            if self.aec and self.aec.find_property("agc-initial-gain-db"):
+                self.aec.set_property("agc-initial-gain-db", float(self.agc_initial_gain_db))
+            if self.aec and self.aec.find_property("agc-max-noise-dbfs"):
+                self.aec.set_property("agc-max-noise-dbfs", float(self.agc_max_noise_dbfs))
+            if self.aec and self.aec.find_property("hpf"):
+                self.aec.set_property("hpf", bool(self.hpf_enabled))
 
             # Tee for branching to VAD and encoder (before AEC)
             capture_tee = Gst.ElementFactory.make("tee", "capture_tee")
-            vad_q = self._make_queue("vad_q", max_buffers=10, leaky=True)
+            vad_q = self._make_queue("vad_q", max_buffers=10, leaky="downstream")
             
             vad_conv = Gst.ElementFactory.make("audioconvert", "vad_conv")
             vad_res = Gst.ElementFactory.make("audioresample", "vad_res")
-            self._set_if_prop(vad_res, "quality", 4)
+            self._set_if_prop(vad_res, "quality", 10)
+            vad_f32_caps = Gst.ElementFactory.make("capsfilter", "vad_f32_caps")
+            vad_f32_caps.set_property(
+                "caps",
+                Gst.Caps.from_string("audio/x-raw,format=F32LE,rate=16000,channels=1,layout=interleaved"),
+            )
+            vad_lpf = self._make_vad_lpf()
+            vad_post_conv = Gst.ElementFactory.make("audioconvert", "vad_post_conv")
             vad_caps = Gst.ElementFactory.make("capsfilter", "vad_caps")
             vad_caps.set_property(
                 "caps",
@@ -188,11 +299,11 @@ class MediaEngine:
             self.vad_sink.set_property("drop", True)
             self.vad_sink.connect("new-sample", self._on_vad_sample)
 
-            dfn_q = self._make_queue("dfn_q", max_buffers=10, leaky=True)
+            dfn_q = self._make_queue("dfn_q", max_buffers=10, leaky=False)
             dfn_in_caps = Gst.ElementFactory.make("capsfilter", "dfn_in_caps")
             dfn_in_caps.set_property(
                 "caps",
-                Gst.Caps.from_string("audio/x-raw,format=F32LE,rate=48000,channels=1,layout=interleaved"),
+                Gst.Caps.from_string(f"audio/x-raw,format=F32LE,rate={self.target_sample_rate},channels=1,layout=interleaved"),
             )
             self.dfn = Gst.ElementFactory.make("deepfilternet", "dfn")
             if disable_dfn:
@@ -221,26 +332,32 @@ class MediaEngine:
                     model_path = os.path.join(models_root, "deepfilternet.onnx")
                     self._set_if_prop(self.dfn, "model-path", model_path)
 
-            post_dfn_q = self._make_queue("post_dfn_q", max_buffers=10, leaky=True)
+            post_dfn_q = self._make_queue("post_dfn_q", max_buffers=10, leaky=False)
             self.send_enabled = not self.is_listen_only
             self.send_valve = self._make_valve(drop=not self.send_enabled)
+            self.eq = self._make_eq()
+            self.eq_active = bool(self.eq and self.eq.get_factory().get_name() != "identity")
+            self.cng_mixer, self.cng_src, self.cng_volume, self.cng_valve = self._make_cng()
+            self.cng_active = bool(self.cng_mixer)
             self.limiter = self._make_limiter()
+            self.limiter_active = bool(self.limiter and self.limiter.get_factory().get_name() != "identity")
             audconv_enc = Gst.ElementFactory.make("audioconvert", "audconv_enc")
             audres_enc = Gst.ElementFactory.make("audioresample", "audres_enc")
+            self._set_if_prop(audres_enc, "quality", 10)
             enc_caps = Gst.ElementFactory.make("capsfilter", "enc_caps")
             enc_caps.set_property(
                 "caps",
-                Gst.Caps.from_string("audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved"),
+                Gst.Caps.from_string(f"audio/x-raw,format=S16LE,rate={self.target_sample_rate},channels=1,layout=interleaved"),
             )
             opusenc = Gst.ElementFactory.make("opusenc", "opusenc")
+            self.opusenc = opusenc
             self._set_if_prop(opusenc, "bitrate", int(self.opus_bitrate))
             self._set_if_prop(opusenc, "frame-size", 10)
             self._set_if_prop(opusenc, "audio-type", "voice")
             self._set_if_prop(opusenc, "complexity", int(self.opus_complexity))
             self._set_if_prop(opusenc, "inband-fec", bool(self.opus_fec))
             self._set_if_prop(opusenc, "dtx", bool(self.opus_dtx))
-            if self.opus_packet_loss > 0:
-                self._set_if_prop(opusenc, "packet-loss-percentage", int(self.opus_packet_loss))
+            self._set_if_prop(opusenc, "packet-loss-percentage", int(self.opus_packet_loss))
 
             rtppay = Gst.ElementFactory.make("rtpopuspay", "rtppay")
             rtppay.set_property("pt", 96)
@@ -271,12 +388,12 @@ class MediaEngine:
                 self._set_if_prop(self.udpsrc, "do-timestamp", True)
 
                 rtp_caps = Gst.Caps.from_string(
-                    "application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload=96"
+                    f"application/x-rtp,media=audio,encoding-name=OPUS,clock-rate={self.target_sample_rate},payload=96"
                 )
                 self.udpsrc.set_property("caps", rtp_caps)
 
                 self.jitter = Gst.ElementFactory.make("rtpjitterbuffer", "jitter")
-                self.jitter_latency_ms = self.jitter_latency_ms_default
+                self.jitter_latency_ms = int(self._clamp(self.jitter_latency_ms_default, self.jitter_min_ms, self.jitter_max_ms))
                 self._last_jitter_adjust_ts = 0.0
                 self.jitter.set_property("latency", self.jitter_latency_ms)
                 self._set_if_prop(self.jitter, "drop-on-late", True)
@@ -286,23 +403,25 @@ class MediaEngine:
                 opusdec = Gst.ElementFactory.make("opusdec", "opusdec")
                 audconv2 = Gst.ElementFactory.make("audioconvert", "audconv2")
                 audres2 = Gst.ElementFactory.make("audioresample", "audres2")
+                self._set_if_prop(audres2, "quality", 10)
                 caps2 = Gst.ElementFactory.make("capsfilter", "caps2")
                 caps2.set_property(
                     "caps",
-                    Gst.Caps.from_string("audio/x-raw,format=F32LE,rate=48000,channels=1,layout=interleaved"),
+                    Gst.Caps.from_string(f"audio/x-raw,format=F32LE,rate={self.target_sample_rate},channels=1,layout=interleaved"),
                 )
 
-                playout_q = self._make_queue("playout_q", max_buffers=10, leaky=True)
+                playout_q = self._make_queue("playout_q", max_buffers=10, leaky=False)
                 playout_conv = Gst.ElementFactory.make("audioconvert", "playout_conv")
                 playout_res = Gst.ElementFactory.make("audioresample", "playout_res")
+                self._set_if_prop(playout_res, "quality", 10)
                 playout_caps = Gst.ElementFactory.make("capsfilter", "playout_caps")
                 playout_caps.set_property(
                     "caps",
-                    Gst.Caps.from_string("audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved"),
+                    Gst.Caps.from_string(f"audio/x-raw,format=S16LE,rate={self.target_sample_rate},channels=1,layout=interleaved"),
                 )
                 if self.aec:
                     playout_tee = Gst.ElementFactory.make("tee", "playout_tee")
-                    render_q = self._make_queue("render_q", max_buffers=10, leaky=True)
+                    render_q = self._make_queue("render_q", max_buffers=10, leaky=False)
 
             # Build elements dict
             elements = {
@@ -310,11 +429,15 @@ class MediaEngine:
                 "audconv1": audconv1,
                 "audres1": audres1,
                 "caps1": caps1,
+                "hpf": self.hpf,
                 "capture_q": capture_q,
                 "capture_tee": capture_tee,
                 "vad_q": vad_q,
                 "vad_conv": vad_conv,
                 "vad_res": vad_res,
+                "vad_f32_caps": vad_f32_caps,
+                "vad_lpf": vad_lpf,
+                "vad_post_conv": vad_post_conv,
                 "vad_caps": vad_caps,
                 "vad_sink": self.vad_sink,
                 "dfn_q": dfn_q,
@@ -322,6 +445,7 @@ class MediaEngine:
                 "dfn": self.dfn,
                 "post_dfn_q": post_dfn_q,
                 "send_valve": self.send_valve,
+                "eq": self.eq,
                 "limiter": self.limiter,
                 "audconv_enc": audconv_enc,
                 "audres_enc": audres_enc,
@@ -330,6 +454,17 @@ class MediaEngine:
                 "rtppay": rtppay,
                 "udpsink": self.udpsink,
             }
+
+            if self.cng_mixer:
+                elements.update({
+                    "cng_mixer": self.cng_mixer,
+                    "cng_src": self.cng_src,
+                    "cng_conv": self.cng_conv,
+                    "cng_res": self.cng_res,
+                    "cng_caps": self.cng_caps,
+                    "cng_volume": self.cng_volume,
+                    "cng_valve": self.cng_valve,
+                })
 
             if self.aec:
                 elements["aec"] = self.aec
@@ -359,24 +494,29 @@ class MediaEngine:
                 self.pipeline.add(element)
 
             # Capture chain: src → tee (AEC runs on the main branch only)
-            self._link_many_or_raise("capture", src, audconv1, audres1, caps1, capture_q, capture_tee)
+            self._link_many_or_raise("capture", src, audconv1, audres1, caps1, self.hpf, capture_q, capture_tee)
 
             # VAD branch: tee → queue → convert → resample → caps → appsink
             # This works in both modes since it comes from capture path
             self._link_tee_src_to("capture→vad", capture_tee, vad_q)
-            self._link_many_or_raise("vad", vad_q, vad_conv, vad_res, vad_caps, self.vad_sink)
+            self._link_many_or_raise("vad", vad_q, vad_conv, vad_res, vad_f32_caps, vad_lpf, vad_post_conv, vad_caps, self.vad_sink)
             
             # Main branch: tee → queue → [AEC] → DFN → Limiter → Opus → RTP
             self._link_tee_src_to("capture→dfn", capture_tee, dfn_q)
             if self.aec:
+                encoder_chain = [dfn_q, self.aec, dfn_in_caps, self.dfn, post_dfn_q, self.send_valve]
+            else:
+                encoder_chain = [dfn_q, dfn_in_caps, self.dfn, post_dfn_q, self.send_valve]
+
+            if self.cng_mixer:
+                self._link_many_or_raise("encoder_pre", *encoder_chain)
+                self._link_to_mixer("cng_voice", self.send_valve, self.cng_mixer)
+                self._link_many_or_raise("cng_noise", self.cng_src, self.cng_conv, self.cng_res, self.cng_caps, self.cng_volume, self.cng_valve)
+                self._link_to_mixer("cng_mix", self.cng_valve, self.cng_mixer)
                 self._link_many_or_raise(
-                    "encoder",
-                    dfn_q,
-                    self.aec,
-                    dfn_in_caps,
-                    self.dfn,
-                    post_dfn_q,
-                    self.send_valve,
+                    "encoder_post",
+                    self.cng_mixer,
+                    self.eq,
                     self.limiter,
                     audconv_enc,
                     audres_enc,
@@ -388,11 +528,8 @@ class MediaEngine:
             else:
                 self._link_many_or_raise(
                     "encoder",
-                    dfn_q,
-                    dfn_in_caps,
-                    self.dfn,
-                    post_dfn_q,
-                    self.send_valve,
+                    *encoder_chain,
+                    self.eq,
                     self.limiter,
                     audconv_enc,
                     audres_enc,
@@ -474,6 +611,8 @@ class MediaEngine:
 
             if self.aec_auto_delay:
                 self._auto_update_aec_delay()
+
+            self._log_sample_rate()
             
             # Export pipeline graph for debugging
             Gst.debug_bin_to_dot_file(self.pipeline, Gst.DebugGraphDetails.ALL, "tchat_pipeline")
@@ -506,7 +645,7 @@ class MediaEngine:
             caps = Gst.ElementFactory.make("capsfilter", None)
             caps.set_property(
                 "caps",
-                Gst.Caps.from_string("audio/x-raw,format=F32LE,rate=48000,channels=1,layout=interleaved"),
+                Gst.Caps.from_string(f"audio/x-raw,format=F32LE,rate={self.target_sample_rate},channels=1,layout=interleaved"),
             )
             sink = Gst.ElementFactory.make("fakesink", None)
             pipeline = Gst.Pipeline.new("tchat_prewarm")
@@ -558,14 +697,29 @@ class MediaEngine:
         with self.lock:
             self.pipeline = None
             self.queues = {}
+            self.queue_overruns = {}
             self.vad_sink = None
             self.vad_sample_count = 0
             self.aec = None
             self.dfn = None
             self.limiter = None
+            self.eq = None
+            self.hpf = None
+            self.cng_mixer = None
+            self.cng_src = None
+            self.cng_volume = None
+            self.cng_valve = None
+            self.cng_conv = None
+            self.cng_res = None
+            self.cng_caps = None
+            self.opusenc = None
             self.send_valve = None
             self.aec_active = None
             self.dfn_active = None
+            self.limiter_active = None
+            self.hpf_active = None
+            self.eq_active = None
+            self.cng_active = None
             self.udpsink = None
             self.udpsrc = None
             self.jitter = None
@@ -599,11 +753,74 @@ class MediaEngine:
             return
         self.start(local_port, ip, port, input_id, output_id)
 
-    def set_processing_options(self, aec_enabled=None, aec_delay_ms=None, aec_auto_delay=None, dfn_enabled=None, dfn_mix=None, dfn_post_filter=None):
+    def set_processing_options(
+        self,
+        aec_enabled=None,
+        aec_delay_ms=None,
+        aec_auto_delay=None,
+        agc_enabled=None,
+        agc_input_volume=None,
+        agc_headroom_db=None,
+        agc_max_gain_db=None,
+        agc_initial_gain_db=None,
+        agc_max_noise_dbfs=None,
+        hpf_enabled=None,
+        hpf_cutoff_hz=None,
+        dfn_enabled=None,
+        dfn_mix=None,
+        dfn_post_filter=None,
+        dfn_vad_link=None,
+        dfn_mix_speech=None,
+        dfn_mix_silence=None,
+        eq_enabled=None,
+        eq_low_gain_db=None,
+        eq_mid_gain_db=None,
+        eq_high_gain_db=None,
+        cng_enabled=None,
+        cng_level_db=None,
+        limiter_threshold_db=None,
+        limiter_attack_ms=None,
+        limiter_release_ms=None,
+        opus_bitrate=None,
+        opus_fec=None,
+        opus_dtx=None,
+        opus_packet_loss=None,
+    ):
         if aec_enabled is not None and not self.disable_aec_env:
             self.aec_enabled = bool(aec_enabled)
+        if agc_enabled is not None and not self.disable_agc_env:
+            self.agc_enabled = bool(agc_enabled)
+        if agc_input_volume is not None:
+            self.agc_input_volume = bool(agc_input_volume)
+        if agc_headroom_db is not None:
+            self.agc_headroom_db = float(agc_headroom_db)
+        if agc_max_gain_db is not None:
+            self.agc_max_gain_db = float(agc_max_gain_db)
+        if agc_initial_gain_db is not None:
+            self.agc_initial_gain_db = float(agc_initial_gain_db)
+        if agc_max_noise_dbfs is not None:
+            self.agc_max_noise_dbfs = float(agc_max_noise_dbfs)
+        if hpf_enabled is not None:
+            self.hpf_enabled = bool(hpf_enabled)
+        if hpf_cutoff_hz is not None:
+            try:
+                self.hpf_cutoff_hz = int(hpf_cutoff_hz)
+            except (TypeError, ValueError):
+                pass
         if dfn_enabled is not None and not self.disable_dfn_env:
             self.dfn_enabled = bool(dfn_enabled)
+        if dfn_vad_link is not None:
+            self.dfn_vad_link = bool(dfn_vad_link)
+        if dfn_mix_speech is not None:
+            try:
+                self.dfn_mix_speech = float(dfn_mix_speech)
+            except (TypeError, ValueError):
+                pass
+        if dfn_mix_silence is not None:
+            try:
+                self.dfn_mix_silence = float(dfn_mix_silence)
+            except (TypeError, ValueError):
+                pass
         if aec_auto_delay is not None:
             self.aec_auto_delay = bool(aec_auto_delay)
         if aec_delay_ms is not None:
@@ -622,9 +839,67 @@ class MediaEngine:
                 self.dfn_post_filter = float(dfn_post_filter)
             except (TypeError, ValueError):
                 pass
+        if eq_enabled is not None:
+            self.eq_enabled = bool(eq_enabled)
+        if eq_low_gain_db is not None:
+            self.eq_low_gain_db = float(eq_low_gain_db)
+        if eq_mid_gain_db is not None:
+            self.eq_mid_gain_db = float(eq_mid_gain_db)
+        if eq_high_gain_db is not None:
+            self.eq_high_gain_db = float(eq_high_gain_db)
+        if cng_enabled is not None:
+            self.cng_enabled = bool(cng_enabled)
+        if cng_level_db is not None:
+            try:
+                self.cng_level_db = float(cng_level_db)
+            except (TypeError, ValueError):
+                pass
+        if limiter_threshold_db is not None:
+            try:
+                self.limiter_threshold_db = float(limiter_threshold_db)
+            except (TypeError, ValueError):
+                pass
+        if limiter_attack_ms is not None:
+            try:
+                self.limiter_attack_ms = float(limiter_attack_ms)
+            except (TypeError, ValueError):
+                pass
+        if limiter_release_ms is not None:
+            try:
+                self.limiter_release_ms = float(limiter_release_ms)
+            except (TypeError, ValueError):
+                pass
+        if opus_bitrate is not None:
+            try:
+                self.opus_bitrate = int(opus_bitrate)
+            except (TypeError, ValueError):
+                pass
+        if opus_fec is not None:
+            self.opus_fec = bool(opus_fec)
+        if opus_dtx is not None:
+            self.opus_dtx = bool(opus_dtx)
+        if opus_packet_loss is not None:
+            try:
+                self.opus_packet_loss = int(opus_packet_loss)
+            except (TypeError, ValueError):
+                pass
 
         if self.aec and self.aec.find_property("bypass"):
             self.aec.set_property("bypass", not self.aec_enabled)
+        if self.aec and self.aec.find_property("agc"):
+            self.aec.set_property("agc", bool(self.agc_enabled))
+        if self.aec and self.aec.find_property("agc-input-volume"):
+            self.aec.set_property("agc-input-volume", bool(self.agc_input_volume))
+        if self.aec and self.aec.find_property("agc-headroom-db"):
+            self.aec.set_property("agc-headroom-db", float(self.agc_headroom_db))
+        if self.aec and self.aec.find_property("agc-max-gain-db"):
+            self.aec.set_property("agc-max-gain-db", float(self.agc_max_gain_db))
+        if self.aec and self.aec.find_property("agc-initial-gain-db"):
+            self.aec.set_property("agc-initial-gain-db", float(self.agc_initial_gain_db))
+        if self.aec and self.aec.find_property("agc-max-noise-dbfs"):
+            self.aec.set_property("agc-max-noise-dbfs", float(self.agc_max_noise_dbfs))
+        if self.aec and self.aec.find_property("hpf"):
+            self.aec.set_property("hpf", bool(self.hpf_enabled))
         if self.aec and self.aec.find_property("auto-delay"):
             self.aec.set_property("auto-delay", bool(self.aec_auto_delay))
         if self.aec_auto_delay:
@@ -637,6 +912,27 @@ class MediaEngine:
             self.dfn.set_property("mix", self._clamp(self.dfn_mix, 0.0, 1.0))
         if self.dfn and self.dfn.find_property("post-filter"):
             self.dfn.set_property("post-filter", self._clamp(self.dfn_post_filter, 0.0, 1.0))
+        if self.eq and self.eq.find_property("band0"):
+            gain = self.eq_low_gain_db if self.eq_enabled else 0.0
+            self.eq.set_property("band0", float(gain))
+        if self.eq and self.eq.find_property("band1"):
+            gain = self.eq_mid_gain_db if self.eq_enabled else 0.0
+            self.eq.set_property("band1", float(gain))
+        if self.eq and self.eq.find_property("band2"):
+            gain = self.eq_high_gain_db if self.eq_enabled else 0.0
+            self.eq.set_property("band2", float(gain))
+        if self.opusenc:
+            self._set_if_prop(self.opusenc, "bitrate", int(self.opus_bitrate))
+            self._set_if_prop(self.opusenc, "inband-fec", bool(self.opus_fec))
+            self._set_if_prop(self.opusenc, "dtx", bool(self.opus_dtx))
+            self._set_if_prop(self.opusenc, "packet-loss-percentage", int(self.opus_packet_loss))
+        if self.hpf and self.hpf.find_property("cutoff"):
+            cutoff = float(self.hpf_cutoff_hz if self.hpf_enabled else 20.0)
+            self._set_if_prop(self.hpf, "cutoff", cutoff)
+        if self.limiter:
+            self._set_if_prop(self.limiter, "threshold", float(self.limiter_threshold_db))
+            self._set_if_prop(self.limiter, "attack", float(self.limiter_attack_ms))
+            self._set_if_prop(self.limiter, "release", float(self.limiter_release_ms))
 
     def poll_metrics(self):
         self._drain_bus_messages()
@@ -660,6 +956,7 @@ class MediaEngine:
                     self._adapt_jitter(value, kind)
             except Exception:
                 pass
+        self._update_vad_driven_processing()
 
     def _drain_bus_messages(self):
         if not self.bus:
@@ -705,6 +1002,15 @@ class MediaEngine:
             src = message.src
             if src:
                 self.logger.error("Error source: %s", src.get_name())
+            self.last_error = f"{err}"
+            if not self._handling_error:
+                self._handling_error = True
+                try:
+                    if self.on_error:
+                        self.on_error(self.last_error)
+                finally:
+                    self.stop()
+                    self._handling_error = False
         elif t == Gst.MessageType.WARNING:
             err, debug = message.parse_warning()
             self.logger.warning("Pipeline WARNING: %s", err)
@@ -719,7 +1025,11 @@ class MediaEngine:
                 p50 = struct.get_value("p50_ms")
                 p95 = struct.get_value("p95_ms")
                 bypass = struct.get_value("bypass_count")
-                self.metrics.update_dfn_stats(p50, p95, bypass)
+                auto_mix = struct.get_value("auto_mix") if struct.has_field("auto_mix") else None
+                auto_bypass = struct.get_value("auto_bypass") if struct.has_field("auto_bypass") else None
+                self.dfn_auto_mix = float(auto_mix) if auto_mix is not None else self.dfn_auto_mix
+                self.dfn_auto_bypass = bool(auto_bypass) if auto_bypass is not None else self.dfn_auto_bypass
+                self.metrics.update_dfn_stats(p50, p95, bypass, auto_mix=auto_mix, auto_bypass=auto_bypass)
 
     def _on_send_probe(self, pad, info):
         buf = info.get_buffer()
@@ -742,14 +1052,30 @@ class MediaEngine:
         self.metrics.update_mic_send_latency(latency_ms)
         return Gst.PadProbeReturn.OK
 
-    def _make_queue(self, name, max_buffers=10, leaky=True):
+    def _make_queue(self, name, max_buffers=10, leaky="downstream"):
         queue = Gst.ElementFactory.make("queue", name)
         queue.set_property("max-size-buffers", max_buffers)
         queue.set_property("max-size-time", 0)
         queue.set_property("max-size-bytes", 0)
-        queue.set_property("leaky", 2 if leaky else 0)
+        if leaky is True or leaky == "downstream":
+            leaky_mode = 2
+        elif leaky == "upstream":
+            leaky_mode = 1
+        else:
+            leaky_mode = 0
+        queue.set_property("leaky", leaky_mode)
+        queue.connect("overrun", self._on_queue_overrun)
         self.queues[name] = queue
         return queue
+
+    def _on_queue_overrun(self, queue):
+        name = queue.get_name() if queue else "unknown"
+        with self.lock:
+            count = self.queue_overruns.get(name, 0) + 1
+            self.queue_overruns[name] = count
+        if count == 1 or count % 50 == 0:
+            self.logger.warning("Queue overrun: %s (%d)", name, count)
+        self.metrics.update_queue_overrun(name, count)
 
     def _make_audio_src(self, device_id):
         if sys.platform.startswith("win"):
@@ -797,17 +1123,18 @@ class MediaEngine:
     def _adapt_jitter(self, value, kind):
         if not self.jitter:
             return
-        now = time.time()
-        if now - self._last_jitter_adjust_ts < 1.0:
+        now = time.monotonic()
+        if now - self._last_jitter_adjust_ts < self.jitter_adjust_interval:
             return
         if kind == "avg-jitter-ms":
-            target = max(20.0, min(200.0, float(value) * 2.0 + 5.0))
+            target = float(value) * 2.0 + 5.0
         elif kind == "queue":
-            target = max(20.0, min(200.0, float(value) * 10.0 + 20.0))
+            target = float(value) * 10.0 + 20.0
         else:
             return
-        new_latency = int(round(self.jitter_latency_ms * 0.8 + target * 0.2))
-        if abs(new_latency - self.jitter_latency_ms) >= 2:
+        target = max(float(self.jitter_min_ms), min(float(self.jitter_max_ms), target))
+        new_latency = int(round(self.jitter_latency_ms * self.jitter_smoothing + target * (1.0 - self.jitter_smoothing)))
+        if abs(new_latency - self.jitter_latency_ms) >= 5:
             self.jitter_latency_ms = new_latency
             self.jitter.set_property("latency", self.jitter_latency_ms)
             self._last_jitter_adjust_ts = now
@@ -839,6 +1166,35 @@ class MediaEngine:
         latency_ms = level_time / Gst.MSECOND
         self.metrics.update_mic_send_latency(latency_ms)
 
+    def _update_vad_driven_processing(self):
+        data = self.metrics.snapshot()
+        speaking = bool(data.get("vad_speaking"))
+        if self.dfn_vad_link and self.dfn and self.dfn.find_property("mix"):
+            target = self.dfn_mix_speech if speaking else self.dfn_mix_silence
+            target = self._clamp(target, 0.0, 1.0)
+            if abs(target - self.dfn_mix) > 0.005:
+                smoothing = self._clamp(self.dfn_mix_smoothing, 0.05, 0.5)
+                self.dfn_mix = (self.dfn_mix * (1.0 - smoothing)) + (target * smoothing)
+                self.dfn.set_property("mix", self.dfn_mix)
+        self._update_cng_state(speaking)
+
+    def _update_cng_state(self, speaking):
+        if not self.cng_mixer or not self.cng_volume or not self.cng_valve:
+            return
+        target_level = 0.0 if speaking or not self.cng_enabled else 10 ** (float(self.cng_level_db) / 20.0)
+        now = time.monotonic()
+        dt = now - self.cng_last_update if self.cng_last_update else 0.0
+        self.cng_last_update = now
+        if self.cng_fade_ms <= 0:
+            self.cng_current_level = target_level
+        else:
+            fade_sec = max(0.01, self.cng_fade_ms / 1000.0)
+            step = min(1.0, dt / fade_sec) if dt > 0 else 1.0
+            self.cng_current_level += (target_level - self.cng_current_level) * step
+        self._set_if_prop(self.cng_volume, "volume", float(self.cng_current_level))
+        drop = self.cng_current_level < 1e-5
+        self._set_if_prop(self.cng_valve, "drop", drop)
+
     def _extract_jitter_metric(self, stats):
         if not stats:
             return None
@@ -865,6 +1221,86 @@ class MediaEngine:
         self._set_if_prop(limiter, "attack", float(self.limiter_attack_ms))
         self._set_if_prop(limiter, "release", float(self.limiter_release_ms))
         return limiter
+
+    def _make_hpf(self):
+        hpf = Gst.ElementFactory.make("audiocheblimit", "hpf")
+        if not hpf:
+            self.logger.warning("audiocheblimit plugin not found; HPF disabled")
+            return Gst.ElementFactory.make("identity", "hpf")
+        try:
+            if hpf.find_property("mode"):
+                try:
+                    hpf.set_property("mode", "high-pass")
+                except Exception:
+                    pass
+            cutoff = float(self.hpf_cutoff_hz if self.hpf_enabled else 20.0)
+            self._set_if_prop(hpf, "cutoff", cutoff)
+            self._set_if_prop(hpf, "poles", 4)
+        except Exception as exc:
+            self.logger.warning("Failed to configure HPF: %s", exc)
+        return hpf
+
+    def _make_vad_lpf(self):
+        lpf = Gst.ElementFactory.make("audiocheblimit", "vad_lpf")
+        if not lpf:
+            return Gst.ElementFactory.make("identity", "vad_lpf")
+        try:
+            if lpf.find_property("mode"):
+                try:
+                    lpf.set_property("mode", "low-pass")
+                except Exception:
+                    pass
+            self._set_if_prop(lpf, "cutoff", 8000.0)
+            self._set_if_prop(lpf, "poles", 4)
+        except Exception:
+            return Gst.ElementFactory.make("identity", "vad_lpf")
+        return lpf
+
+    def _make_eq(self):
+        eq = Gst.ElementFactory.make("equalizer-3bands", "eq")
+        if not eq:
+            self.logger.warning("equalizer-3bands plugin not found; EQ disabled")
+            return Gst.ElementFactory.make("identity", "eq")
+        if self.eq_enabled:
+            self._set_if_prop(eq, "band0", float(self.eq_low_gain_db))
+            self._set_if_prop(eq, "band1", float(self.eq_mid_gain_db))
+            self._set_if_prop(eq, "band2", float(self.eq_high_gain_db))
+        else:
+            self._set_if_prop(eq, "band0", 0.0)
+            self._set_if_prop(eq, "band1", 0.0)
+            self._set_if_prop(eq, "band2", 0.0)
+        return eq
+
+    def _make_cng(self):
+        mixer = Gst.ElementFactory.make("audiomixer", "cng_mixer")
+        if not mixer:
+            self.logger.warning("audiomixer plugin not found; CNG disabled")
+            return None, None, None, None
+        src = Gst.ElementFactory.make("audiotestsrc", "cng_src")
+        conv = Gst.ElementFactory.make("audioconvert", "cng_conv")
+        res = Gst.ElementFactory.make("audioresample", "cng_res")
+        caps = Gst.ElementFactory.make("capsfilter", "cng_caps")
+        volume = Gst.ElementFactory.make("volume", "cng_volume")
+        valve = Gst.ElementFactory.make("valve", "cng_valve")
+        if not src or not conv or not res or not caps or not volume or not valve:
+            self.logger.warning("CNG elements missing; disabled")
+            return None, None, None, None
+        self._set_if_prop(res, "quality", 10)
+        self._set_if_prop(src, "is-live", True)
+        self._set_if_prop(src, "wave", "white-noise")
+        caps.set_property(
+            "caps",
+            Gst.Caps.from_string(f"audio/x-raw,format=F32LE,rate={self.target_sample_rate},channels=1,layout=interleaved"),
+        )
+        level = 10 ** (float(self.cng_level_db) / 20.0)
+        self.cng_current_level = level if (self.cng_enabled and not self.is_listen_only) else 0.0
+        self.cng_target_level = self.cng_current_level
+        self._set_if_prop(volume, "volume", float(self.cng_current_level))
+        self._set_if_prop(valve, "drop", self.cng_current_level < 1e-5)
+        self.cng_conv = conv
+        self.cng_res = res
+        self.cng_caps = caps
+        return mixer, src, volume, valve
 
     def _make_valve(self, drop=False):
         valve = Gst.ElementFactory.make("valve", "send_valve")
@@ -923,6 +1359,29 @@ class MediaEngine:
         if self.aec.find_property("stream-delay-ms"):
             self.aec.set_property("stream-delay-ms", int(self.aec_delay_ms))
 
+    def _log_sample_rate(self):
+        rate = None
+        if self.audio_src:
+            try:
+                pad = self.audio_src.get_static_pad("src")
+                if pad:
+                    caps = pad.get_current_caps()
+                    if caps:
+                        rate = caps.get_structure(0).get_value("rate")
+            except Exception:
+                rate = None
+        if rate:
+            try:
+                self.input_sample_rate = int(rate)
+            except (TypeError, ValueError):
+                self.input_sample_rate = None
+        self.metrics.update_sample_rates(self.input_sample_rate, self.target_sample_rate)
+        if self.input_sample_rate:
+            if self.input_sample_rate != self.target_sample_rate:
+                self.logger.warning("Input sample rate %s Hz, resampling to %s Hz", self.input_sample_rate, self.target_sample_rate)
+            else:
+                self.logger.info("Input sample rate %s Hz", self.input_sample_rate)
+
     def _estimate_aec_delay_ms(self):
         if not self.audio_src or not self.audio_sink:
             return None
@@ -976,3 +1435,15 @@ class MediaEngine:
             raise RuntimeError(f"Missing sink pad {sink_pad_name} ({label})")
         self._pad_link_or_raise(label, tee_src, sink_pad)
         return tee_src
+
+    def _link_to_mixer(self, label, src_elem, mixer):
+        if not mixer:
+            raise RuntimeError(f"Missing mixer ({label})")
+        src_pad = src_elem.get_static_pad("src")
+        if src_pad is None:
+            raise RuntimeError(f"Missing src pad ({label})")
+        sink_pad = mixer.get_request_pad("sink_%u")
+        if sink_pad is None:
+            raise RuntimeError(f"Failed to request mixer sink pad ({label})")
+        self._pad_link_or_raise(label, src_pad, sink_pad)
+        return sink_pad

@@ -36,6 +36,9 @@ class VADWorker(threading.Thread):
         self.stop_event = stop_event
         self.logger = logging.getLogger("VAD")
         self.session = None
+        self.input_buf = np.zeros(self.INPUT_SIZE, dtype=np.float32)
+        self.input_view = self.input_buf.reshape(1, -1)
+        self.feed = None
 
         def _env_float(name, default):
             try:
@@ -61,6 +64,16 @@ class VADWorker(threading.Thread):
         self.state = np.zeros(self.STATE_SHAPE, dtype=np.float32)
         self.context = np.zeros(self.CONTEXT_SIZE, dtype=np.float32)
         self.sr = np.array(self.SAMPLE_RATE, dtype=np.int64)
+        if self.input_buf is not None:
+            self.input_buf.fill(0.0)
+
+    def reset_runtime(self):
+        self._reset_state()
+        self.buffer_16k.clear()
+        self.buffer_samples = 0
+        self.speaking = False
+        self.above_ms = 0.0
+        self.below_ms = 0.0
 
     def load_model(self):
         if self.session is not None:
@@ -88,6 +101,11 @@ class VADWorker(threading.Thread):
             self.logger.info("VAD model loaded: %s", self.model_path)
             self.logger.info("Config: window=%d, context=%d, total_input=%d @ %dHz",
                            self.WINDOW_SIZE, self.CONTEXT_SIZE, self.INPUT_SIZE, self.SAMPLE_RATE)
+            self.feed = {
+                'input': self.input_view,
+                'state': self.state,
+                'sr': self.sr
+            }
             return True
         except Exception as exc:
             self.logger.exception("Failed to load VAD model: %s", exc)
@@ -130,19 +148,17 @@ class VADWorker(threading.Thread):
                 energy_prob = (energy_db - self.energy_off_db) / denom
                 energy_prob = float(np.clip(energy_prob, 0.0, 1.0))
 
-                input_data = np.concatenate([self.context, chunk])
-                inp = input_data.reshape(1, -1).astype(np.float32)
+                self.input_buf[:self.CONTEXT_SIZE] = self.context
+                self.input_buf[self.CONTEXT_SIZE:] = chunk
                 prob_value = energy_prob
 
                 if self.session:
                     try:
-                        feed = {
-                            'input': inp,
-                            'state': self.state,
-                            'sr': self.sr
-                        }
-                        
-                        res = self.session.run(None, feed)
+                        if self.feed is None:
+                            self.feed = {'input': self.input_view, 'state': self.state, 'sr': self.sr}
+                        else:
+                            self.feed['state'] = self.state
+                        res = self.session.run(None, self.feed)
                         
                         prob = res[0]
                         if len(res) > 1:
@@ -155,13 +171,13 @@ class VADWorker(threading.Thread):
                     except Exception:
                         error_count += 1
                         if error_count <= max_errors:
-                            self.logger.exception("VAD inference failed (input shape: %s)", inp.shape)
+                            self.logger.exception("VAD inference failed (input shape: %s)", self.input_view.shape)
                         elif error_count == max_errors + 1:
                             self.logger.error("VAD inference errors exceeded limit, suppressing further logs")
                         if not self.use_energy_fallback:
                             prob_value = 0.0
 
-                self.context = chunk[-self.CONTEXT_SIZE:]
+                self.context[:] = chunk[-self.CONTEXT_SIZE:]
                 frame_count += 1
                 if frame_count % 30 == 0:
                     if self.session:
@@ -234,10 +250,11 @@ class VADManager:
             self.logger.warning("VAD worker already running")
             return
         self.stop_event.clear()
-        if not self._preloaded:
-            self.worker = VADWorker(self.ring, self.metrics, self.model_path, self.stop_event)
-        else:
+        if self._preloaded:
             self._preloaded = False
+            self.worker.reset_runtime()
+        else:
+            self.worker = VADWorker(self.ring, self.metrics, self.model_path, self.stop_event)
         self.worker.start()
 
     def stop(self):
@@ -248,7 +265,10 @@ class VADManager:
     def preload(self):
         if self._preloaded:
             return
+        if self.worker.is_alive():
+            return
         try:
+            self.worker = VADWorker(self.ring, self.metrics, self.model_path, self.stop_event)
             ok = self.worker.load_model()
             if ok:
                 self._preloaded = True

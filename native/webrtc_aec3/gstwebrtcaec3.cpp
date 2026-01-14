@@ -9,6 +9,7 @@
 #include <api/environment/environment_factory.h>
 #include <api/scoped_refptr.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -28,6 +29,7 @@ struct _GstWebRtcAec3 {
     GstAdapter *render_adapter;
     guint frame_bytes;
     guint frame_samples;
+    gint sample_rate;
     gboolean bypass;
     gint stream_delay_ms;
     gboolean auto_delay;
@@ -37,9 +39,17 @@ struct _GstWebRtcAec3 {
     gint delay_update_frames;
     gint delay_frame_count;
     float delay_smoothing;
+    float delay_corr_threshold;
     std::vector<float> render_ring;
     size_t render_ring_pos;
     guint64 render_samples_seen;
+    gboolean agc_enabled;
+    gboolean agc_input_volume;
+    float agc_headroom_db;
+    float agc_max_gain_db;
+    float agc_initial_gain_db;
+    float agc_max_noise_dbfs;
+    gboolean hpf_enabled;
     GMutex lock;
     WebRtcAec3Private *priv;
 };
@@ -58,6 +68,13 @@ enum {
     PROP_BYPASS,
     PROP_STREAM_DELAY_MS,
     PROP_AUTO_DELAY,
+    PROP_AGC_ENABLED,
+    PROP_AGC_INPUT_VOLUME,
+    PROP_AGC_HEADROOM_DB,
+    PROP_AGC_MAX_GAIN_DB,
+    PROP_AGC_INITIAL_GAIN_DB,
+    PROP_AGC_MAX_NOISE_DBFS,
+    PROP_HPF_ENABLED,
     PROP_ESTIMATED_DELAY_MS,
 };
 
@@ -65,19 +82,82 @@ static GstStaticPadTemplate capture_sink_template = GST_STATIC_PAD_TEMPLATE(
     "sink",
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS("audio/x-raw,format=F32LE,rate=48000,channels=1,layout=interleaved"));
+    GST_STATIC_CAPS("audio/x-raw,format=F32LE,rate=[8000,96000],channels=1,layout=interleaved"));
 
 static GstStaticPadTemplate render_sink_template = GST_STATIC_PAD_TEMPLATE(
     "render_sink",
     GST_PAD_SINK,
     GST_PAD_REQUEST,
-    GST_STATIC_CAPS("audio/x-raw,format=F32LE,rate=48000,channels=1,layout=interleaved"));
+    GST_STATIC_CAPS("audio/x-raw,format=F32LE,rate=[8000,96000],channels=1,layout=interleaved"));
 
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
     "src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS("audio/x-raw,format=F32LE,rate=48000,channels=1,layout=interleaved"));
+    GST_STATIC_CAPS("audio/x-raw,format=F32LE,rate=[8000,96000],channels=1,layout=interleaved"));
+
+static GstStateChangeReturn gst_webrtc_aec3_change_state(GstElement *element, GstStateChange transition);
+
+static webrtc::AudioProcessing::Config gst_webrtc_aec3_build_config(GstWebRtcAec3 *self) {
+    webrtc::AudioProcessing::Config cfg;
+    cfg.echo_canceller.enabled = true;
+    cfg.gain_controller2.enabled = self->agc_enabled;
+    cfg.gain_controller2.adaptive_digital.enabled = self->agc_enabled;
+    cfg.gain_controller2.input_volume_controller.enabled = self->agc_enabled && self->agc_input_volume;
+    cfg.gain_controller2.adaptive_digital.headroom_db = self->agc_headroom_db;
+    cfg.gain_controller2.adaptive_digital.max_gain_db = self->agc_max_gain_db;
+    cfg.gain_controller2.adaptive_digital.initial_gain_db = self->agc_initial_gain_db;
+    cfg.gain_controller2.adaptive_digital.max_output_noise_level_dbfs = self->agc_max_noise_dbfs;
+    cfg.high_pass_filter.enabled = self->hpf_enabled;
+    return cfg;
+}
+
+static gboolean gst_webrtc_aec3_ensure_apm(GstWebRtcAec3 *self) {
+    if (self->bypass) {
+        return FALSE;
+    }
+    g_mutex_lock(&self->lock);
+    if (!self->priv->apm) {
+        webrtc::BuiltinAudioProcessingBuilder builder;
+        builder.SetConfig(gst_webrtc_aec3_build_config(self));
+        self->priv->apm = builder.Build(webrtc::CreateEnvironment());
+        if (self->priv->apm) {
+            self->priv->apm->Initialize();
+        }
+    }
+    g_mutex_unlock(&self->lock);
+    return self->priv->apm != nullptr;
+}
+
+static void gst_webrtc_aec3_apply_config(GstWebRtcAec3 *self) {
+    if (!self->priv->apm) {
+        return;
+    }
+    g_mutex_lock(&self->lock);
+    self->priv->apm->ApplyConfig(gst_webrtc_aec3_build_config(self));
+    g_mutex_unlock(&self->lock);
+}
+
+static void gst_webrtc_aec3_update_rate(GstWebRtcAec3 *self, gint rate) {
+    if (rate <= 0 || rate == self->sample_rate) {
+        return;
+    }
+    g_mutex_lock(&self->lock);
+    self->sample_rate = rate;
+    self->frame_samples = static_cast<guint>(std::max(1, rate / 100));
+    self->frame_bytes = self->frame_samples * sizeof(float);
+    self->render_samples_seen = 0;
+    self->render_ring_pos = 0;
+    const int samples_per_ms = std::max(1, rate / 1000);
+    self->render_ring.assign(static_cast<size_t>(self->max_delay_ms * samples_per_ms + self->frame_samples), 0.0f);
+    self->priv->render_scratch.assign(self->frame_samples, 0.0f);
+    gst_adapter_clear(self->capture_adapter);
+    gst_adapter_clear(self->render_adapter);
+    if (self->priv->apm) {
+        self->priv->apm->Initialize();
+    }
+    g_mutex_unlock(&self->lock);
+}
 
 static GstFlowReturn gst_webrtc_aec3_process_capture(GstWebRtcAec3 *self, GstBuffer *inbuf) {
     GstMapInfo map_in;
@@ -98,16 +178,10 @@ static GstFlowReturn gst_webrtc_aec3_process_capture(GstWebRtcAec3 *self, GstBuf
     const float *in = reinterpret_cast<const float *>(map_in.data);
     float *out = reinterpret_cast<float *>(map_out.data);
 
-    if (!self->bypass && !self->priv->apm) {
-        webrtc::AudioProcessing::Config cfg;
-        cfg.echo_canceller.enabled = true;
-        webrtc::BuiltinAudioProcessingBuilder builder;
-        builder.SetConfig(cfg);
-        self->priv->apm = builder.Build(webrtc::CreateEnvironment());
-    }
+    gst_webrtc_aec3_ensure_apm(self);
 
     if (self->priv->apm && !self->bypass) {
-        webrtc::StreamConfig cfg(48000, 1);
+        webrtc::StreamConfig cfg(self->sample_rate, 1);
         const float *in_ptr[1] = {in};
         float *out_ptr[1] = {out};
         g_mutex_lock(&self->lock);
@@ -120,7 +194,7 @@ static GstFlowReturn gst_webrtc_aec3_process_capture(GstWebRtcAec3 *self, GstBuf
                     cap_energy += in[i] * in[i];
                 }
                 if (cap_energy > 1e-6f && !self->render_ring.empty()) {
-                    const int sample_rate = 48000;
+                    const int sample_rate = self->sample_rate;
                     int max_delay_samples = static_cast<int>(self->render_ring.size()) - static_cast<int>(self->frame_samples);
                     if (max_delay_samples > 0) {
                         const int configured_max = (self->max_delay_ms * sample_rate) / 1000;
@@ -149,7 +223,7 @@ static GstFlowReturn gst_webrtc_aec3_process_capture(GstWebRtcAec3 *self, GstBuf
                                 best_delay_ms = (delay_samples * 1000) / sample_rate;
                             }
                         }
-                        if (best_corr > 0.25f) {
+                        if (best_corr > self->delay_corr_threshold) {
                             int target = best_delay_ms;
                             int smoothed = static_cast<int>(std::round(self->delay_smoothing * self->estimated_delay_ms + (1.0f - self->delay_smoothing) * target));
                             if (std::abs(smoothed - self->estimated_delay_ms) >= 5) {
@@ -175,7 +249,7 @@ static GstFlowReturn gst_webrtc_aec3_process_capture(GstWebRtcAec3 *self, GstBuf
     gst_buffer_unref(inbuf);
     gst_buffer_unmap(outbuf, &map_out);
     if (dur == GST_CLOCK_TIME_NONE) {
-        dur = gst_util_uint64_scale_int(GST_SECOND, self->frame_samples, 48000);
+        dur = gst_util_uint64_scale_int(GST_SECOND, self->frame_samples, self->sample_rate);
     }
     GST_BUFFER_PTS(outbuf) = pts;
     GST_BUFFER_DURATION(outbuf) = dur;
@@ -198,6 +272,17 @@ static GstFlowReturn gst_webrtc_aec3_chain_capture(GstPad *pad, GstObject *paren
 
 static gboolean gst_webrtc_aec3_sink_event(GstPad *pad, GstObject *parent, GstEvent *event) {
     GstWebRtcAec3 *self = GST_WEBRTC_AEC3(parent);
+    if (GST_EVENT_TYPE(event) == GST_EVENT_CAPS) {
+        GstCaps *caps = nullptr;
+        gst_event_parse_caps(event, &caps);
+        if (caps) {
+            const GstStructure *s = gst_caps_get_structure(caps, 0);
+            gint rate = 0;
+            if (gst_structure_get_int(s, "rate", &rate) && rate > 0) {
+                gst_webrtc_aec3_update_rate(self, rate);
+            }
+        }
+    }
     GstEvent *forward = gst_event_ref(event);
     gboolean ret = gst_pad_event_default(pad, parent, event);
     if (ret && self->srcpad) {
@@ -211,6 +296,7 @@ static gboolean gst_webrtc_aec3_sink_event(GstPad *pad, GstObject *parent, GstEv
 static GstFlowReturn gst_webrtc_aec3_chain_render(GstPad *pad, GstObject *parent, GstBuffer *buffer) {
     GstWebRtcAec3 *self = GST_WEBRTC_AEC3(parent);
     gst_adapter_push(self->render_adapter, buffer);
+    gst_webrtc_aec3_ensure_apm(self);
     while (gst_adapter_available(self->render_adapter) >= self->frame_bytes) {
         GstBuffer *inbuf = gst_adapter_take_buffer(self->render_adapter, self->frame_bytes);
         GstMapInfo map_in;
@@ -220,6 +306,7 @@ static GstFlowReturn gst_webrtc_aec3_chain_render(GstPad *pad, GstObject *parent
         }
         const float *in = reinterpret_cast<const float *>(map_in.data);
         float *tmp = self->priv->render_scratch.data();
+        g_mutex_lock(&self->lock);
         if (!self->render_ring.empty()) {
             for (guint i = 0; i < self->frame_samples; ++i) {
                 self->render_ring[self->render_ring_pos] = in[i];
@@ -227,14 +314,13 @@ static GstFlowReturn gst_webrtc_aec3_chain_render(GstPad *pad, GstObject *parent
             }
             self->render_samples_seen += self->frame_samples;
         }
-        if (self->priv->apm) {
-            webrtc::StreamConfig cfg(48000, 1);
+        if (self->priv->apm && !self->bypass) {
+            webrtc::StreamConfig cfg(self->sample_rate, 1);
             const float *in_ptr[1] = {in};
             float *out_ptr[1] = {tmp};
-            g_mutex_lock(&self->lock);
             self->priv->apm->ProcessReverseStream(in_ptr, cfg, cfg, out_ptr);
-            g_mutex_unlock(&self->lock);
         }
+        g_mutex_unlock(&self->lock);
         gst_buffer_unmap(inbuf, &map_in);
         gst_buffer_unref(inbuf);
     }
@@ -248,6 +334,7 @@ static GstPad *gst_webrtc_aec3_request_new_pad(GstElement *element, GstPadTempla
     }
     self->render_sinkpad = gst_pad_new_from_template(templ, name ? name : "render_sink");
     gst_pad_set_chain_function(self->render_sinkpad, GST_DEBUG_FUNCPTR(gst_webrtc_aec3_chain_render));
+    gst_pad_set_event_function(self->render_sinkpad, GST_DEBUG_FUNCPTR(gst_webrtc_aec3_sink_event));
     gst_element_add_pad(GST_ELEMENT(self), self->render_sinkpad);
     return self->render_sinkpad;
 }
@@ -283,6 +370,9 @@ static void gst_webrtc_aec3_set_property(GObject *object, guint prop_id, const G
     switch (prop_id) {
         case PROP_BYPASS:
             self->bypass = g_value_get_boolean(value);
+            if (!self->bypass) {
+                gst_webrtc_aec3_ensure_apm(self);
+            }
             break;
         case PROP_STREAM_DELAY_MS:
             self->stream_delay_ms = g_value_get_int(value);
@@ -293,6 +383,34 @@ static void gst_webrtc_aec3_set_property(GObject *object, guint prop_id, const G
             break;
         case PROP_AUTO_DELAY:
             self->auto_delay = g_value_get_boolean(value);
+            break;
+        case PROP_AGC_ENABLED:
+            self->agc_enabled = g_value_get_boolean(value);
+            gst_webrtc_aec3_apply_config(self);
+            break;
+        case PROP_AGC_INPUT_VOLUME:
+            self->agc_input_volume = g_value_get_boolean(value);
+            gst_webrtc_aec3_apply_config(self);
+            break;
+        case PROP_AGC_HEADROOM_DB:
+            self->agc_headroom_db = g_value_get_float(value);
+            gst_webrtc_aec3_apply_config(self);
+            break;
+        case PROP_AGC_MAX_GAIN_DB:
+            self->agc_max_gain_db = g_value_get_float(value);
+            gst_webrtc_aec3_apply_config(self);
+            break;
+        case PROP_AGC_INITIAL_GAIN_DB:
+            self->agc_initial_gain_db = g_value_get_float(value);
+            gst_webrtc_aec3_apply_config(self);
+            break;
+        case PROP_AGC_MAX_NOISE_DBFS:
+            self->agc_max_noise_dbfs = g_value_get_float(value);
+            gst_webrtc_aec3_apply_config(self);
+            break;
+        case PROP_HPF_ENABLED:
+            self->hpf_enabled = g_value_get_boolean(value);
+            gst_webrtc_aec3_apply_config(self);
             break;
         default:
             G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -311,6 +429,27 @@ static void gst_webrtc_aec3_get_property(GObject *object, guint prop_id, GValue 
             break;
         case PROP_AUTO_DELAY:
             g_value_set_boolean(value, self->auto_delay);
+            break;
+        case PROP_AGC_ENABLED:
+            g_value_set_boolean(value, self->agc_enabled);
+            break;
+        case PROP_AGC_INPUT_VOLUME:
+            g_value_set_boolean(value, self->agc_input_volume);
+            break;
+        case PROP_AGC_HEADROOM_DB:
+            g_value_set_float(value, self->agc_headroom_db);
+            break;
+        case PROP_AGC_MAX_GAIN_DB:
+            g_value_set_float(value, self->agc_max_gain_db);
+            break;
+        case PROP_AGC_INITIAL_GAIN_DB:
+            g_value_set_float(value, self->agc_initial_gain_db);
+            break;
+        case PROP_AGC_MAX_NOISE_DBFS:
+            g_value_set_float(value, self->agc_max_noise_dbfs);
+            break;
+        case PROP_HPF_ENABLED:
+            g_value_set_boolean(value, self->hpf_enabled);
             break;
         case PROP_ESTIMATED_DELAY_MS:
             g_value_set_int(value, self->estimated_delay_ms);
@@ -336,6 +475,7 @@ static void gst_webrtc_aec3_class_init(GstWebRtcAec3Class *klass) {
 
     element_class->request_new_pad = gst_webrtc_aec3_request_new_pad;
     element_class->release_pad = gst_webrtc_aec3_release_pad;
+    element_class->change_state = gst_webrtc_aec3_change_state;
 
     GObjectClass *gobject_class = G_OBJECT_CLASS(klass);
     gobject_class->set_property = gst_webrtc_aec3_set_property;
@@ -356,13 +496,66 @@ static void gst_webrtc_aec3_class_init(GstWebRtcAec3Class *klass) {
         g_param_spec_boolean("auto-delay", "Auto Delay", "Enable automatic delay estimation", TRUE, GParamFlags(G_PARAM_READWRITE)));
     g_object_class_install_property(
         gobject_class,
+        PROP_AGC_ENABLED,
+        g_param_spec_boolean("agc", "AGC", "Enable WebRTC AGC (gain control)", TRUE, GParamFlags(G_PARAM_READWRITE)));
+    g_object_class_install_property(
+        gobject_class,
+        PROP_AGC_INPUT_VOLUME,
+        g_param_spec_boolean("agc-input-volume", "AGC Input Volume", "Enable AGC input volume controller", FALSE, GParamFlags(G_PARAM_READWRITE)));
+    g_object_class_install_property(
+        gobject_class,
+        PROP_AGC_HEADROOM_DB,
+        g_param_spec_float("agc-headroom-db", "AGC Headroom (dB)", "AGC2 headroom in dB", 0.0f, 20.0f, 5.0f, GParamFlags(G_PARAM_READWRITE)));
+    g_object_class_install_property(
+        gobject_class,
+        PROP_AGC_MAX_GAIN_DB,
+        g_param_spec_float("agc-max-gain-db", "AGC Max Gain (dB)", "AGC2 max gain in dB", 0.0f, 80.0f, 50.0f, GParamFlags(G_PARAM_READWRITE)));
+    g_object_class_install_property(
+        gobject_class,
+        PROP_AGC_INITIAL_GAIN_DB,
+        g_param_spec_float("agc-initial-gain-db", "AGC Initial Gain (dB)", "AGC2 initial gain in dB", 0.0f, 30.0f, 15.0f, GParamFlags(G_PARAM_READWRITE)));
+    g_object_class_install_property(
+        gobject_class,
+        PROP_AGC_MAX_NOISE_DBFS,
+        g_param_spec_float("agc-max-noise-dbfs", "AGC Max Noise (dBFS)", "AGC2 max output noise level", -100.0f, -20.0f, -50.0f, GParamFlags(G_PARAM_READWRITE)));
+    g_object_class_install_property(
+        gobject_class,
+        PROP_HPF_ENABLED,
+        g_param_spec_boolean("hpf", "High Pass Filter", "Enable WebRTC high-pass filter", TRUE, GParamFlags(G_PARAM_READWRITE)));
+    g_object_class_install_property(
+        gobject_class,
         PROP_ESTIMATED_DELAY_MS,
         g_param_spec_int("estimated-delay-ms", "Estimated Delay (ms)", "Estimated AEC delay in milliseconds", 0, 500, 0, GParamFlags(G_PARAM_READABLE)));
+}
+
+static GstStateChangeReturn gst_webrtc_aec3_change_state(GstElement *element, GstStateChange transition) {
+    GstWebRtcAec3 *self = GST_WEBRTC_AEC3(element);
+    switch (transition) {
+        case GST_STATE_CHANGE_READY_TO_PAUSED:
+            gst_webrtc_aec3_ensure_apm(self);
+            break;
+        case GST_STATE_CHANGE_PAUSED_TO_READY:
+            g_mutex_lock(&self->lock);
+            self->render_samples_seen = 0;
+            self->render_ring_pos = 0;
+            std::fill(self->render_ring.begin(), self->render_ring.end(), 0.0f);
+            self->delay_frame_count = 0;
+            self->estimated_delay_ms = self->stream_delay_ms;
+            if (self->priv->apm) {
+                self->priv->apm->Initialize();
+            }
+            g_mutex_unlock(&self->lock);
+            break;
+        default:
+            break;
+    }
+    return GST_ELEMENT_CLASS(gst_webrtc_aec3_parent_class)->change_state(element, transition);
 }
 
 static void gst_webrtc_aec3_init(GstWebRtcAec3 *self) {
     self->frame_samples = 480;
     self->frame_bytes = self->frame_samples * sizeof(float);
+    self->sample_rate = 48000;
     self->capture_adapter = gst_adapter_new();
     self->render_adapter = gst_adapter_new();
     self->bypass = FALSE;
@@ -374,7 +567,16 @@ static void gst_webrtc_aec3_init(GstWebRtcAec3 *self) {
     self->delay_update_frames = 10;
     self->delay_frame_count = 0;
     self->delay_smoothing = 0.9f;
-    self->render_ring.resize(static_cast<size_t>(self->max_delay_ms * 48 + self->frame_samples));
+    self->delay_corr_threshold = 0.45f;
+    self->agc_enabled = TRUE;
+    self->agc_input_volume = FALSE;
+    self->agc_headroom_db = 5.0f;
+    self->agc_max_gain_db = 50.0f;
+    self->agc_initial_gain_db = 15.0f;
+    self->agc_max_noise_dbfs = -50.0f;
+    self->hpf_enabled = TRUE;
+    const int samples_per_ms = self->sample_rate / 1000;
+    self->render_ring.resize(static_cast<size_t>(self->max_delay_ms * samples_per_ms + self->frame_samples));
     self->render_ring_pos = 0;
     self->render_samples_seen = 0;
     
