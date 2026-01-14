@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #ifndef PACKAGE
@@ -368,6 +369,28 @@ static void dfn_free_name_array(gchar **names, size_t count) {
     }
 }
 
+static std::basic_string<ORTCHAR_T> dfn_make_ort_path(const gchar *path) {
+#ifdef _WIN32
+    if (!path) {
+        return std::basic_string<ORTCHAR_T>();
+    }
+    GError *error = nullptr;
+    gsize items = 0;
+    gunichar2 *utf16 = g_utf8_to_utf16(path, -1, nullptr, &items, &error);
+    if (!utf16) {
+        if (error) {
+            g_error_free(error);
+        }
+        return std::basic_string<ORTCHAR_T>();
+    }
+    std::basic_string<ORTCHAR_T> out(reinterpret_cast<wchar_t *>(utf16), items);
+    g_free(utf16);
+    return out;
+#else
+    return std::basic_string<ORTCHAR_T>(path ? path : "");
+#endif
+}
+
 static gboolean dfn_init_single_session(GstDeepFilterNet *self) {
     if (!self->model_path || !g_file_test(self->model_path, G_FILE_TEST_EXISTS)) {
         return FALSE;
@@ -383,7 +406,11 @@ static gboolean dfn_init_single_session(GstDeepFilterNet *self) {
         self->ort->ReleaseSession(self->single_session);
         self->single_session = nullptr;
     }
-    if (!ort_ok(self, self->ort->CreateSession(self->env, self->model_path, self->session_opts, &self->single_session), "CreateSession single")) {
+    std::basic_string<ORTCHAR_T> ort_path = dfn_make_ort_path(self->model_path);
+    if (ort_path.empty()) {
+        return FALSE;
+    }
+    if (!ort_ok(self, self->ort->CreateSession(self->env, ort_path.c_str(), self->session_opts, &self->single_session), "CreateSession single")) {
         return FALSE;
     }
 
@@ -449,13 +476,19 @@ static gboolean dfn_init_dfn3_session(GstDeepFilterNet *self) {
         self->df_session = nullptr;
     }
 
-    if (!ort_ok(self, self->ort->CreateSession(self->env, enc_path, self->session_opts, &self->enc_session), "CreateSession enc")) {
+    std::basic_string<ORTCHAR_T> enc_path_ort = dfn_make_ort_path(enc_path);
+    std::basic_string<ORTCHAR_T> erb_path_ort = dfn_make_ort_path(erb_path);
+    std::basic_string<ORTCHAR_T> df_path_ort = dfn_make_ort_path(df_path);
+    if (enc_path_ort.empty() || erb_path_ort.empty() || df_path_ort.empty()) {
         ok = FALSE;
     }
-    if (ok && !ort_ok(self, self->ort->CreateSession(self->env, erb_path, self->session_opts, &self->erb_session), "CreateSession erb")) {
+    if (ok && !ort_ok(self, self->ort->CreateSession(self->env, enc_path_ort.c_str(), self->session_opts, &self->enc_session), "CreateSession enc")) {
         ok = FALSE;
     }
-    if (ok && !ort_ok(self, self->ort->CreateSession(self->env, df_path, self->session_opts, &self->df_session), "CreateSession df")) {
+    if (ok && !ort_ok(self, self->ort->CreateSession(self->env, erb_path_ort.c_str(), self->session_opts, &self->erb_session), "CreateSession erb")) {
+        ok = FALSE;
+    }
+    if (ok && !ort_ok(self, self->ort->CreateSession(self->env, df_path_ort.c_str(), self->session_opts, &self->df_session), "CreateSession df")) {
         ok = FALSE;
     }
 

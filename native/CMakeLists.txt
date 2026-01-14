@@ -1,7 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
 project(tchat_native LANGUAGES C CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+if (WIN32)
+    set(CMAKE_CXX_STANDARD 20)
+else()
+    set(CMAKE_CXX_STANDARD 17)
+endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(PkgConfig REQUIRED)
@@ -123,6 +127,29 @@ if (WEBRTC_LIB_DIR)
 endif()
 
 if (WEBRTC_LIB_DIR AND WEBRTC_LIBS STREQUAL "")
+    if (WIN32)
+        file(GLOB_RECURSE WEBRTC_LIB_FILES
+            "${WEBRTC_LIB_ROOT}/api/**/*.lib"
+            "${WEBRTC_LIB_ROOT}/modules/audio_processing/**/*.lib"
+            "${WEBRTC_LIB_ROOT}/common_audio/**/*.lib"
+            "${WEBRTC_LIB_ROOT}/audio/utility/**/*.lib"
+            "${WEBRTC_LIB_ROOT}/rtc_base/**/*.lib"
+            "${WEBRTC_LIB_ROOT}/system_wrappers/**/*.lib"
+            "${WEBRTC_LIB_ROOT}/third_party/pffft/**/*.lib"
+            "${WEBRTC_LIB_ROOT}/third_party/protobuf/**/*.lib"
+        )
+        file(GLOB_RECURSE WEBRTC_OBJ_FILES
+            "${WEBRTC_LIB_ROOT}/api/**/*.obj"
+            "${WEBRTC_LIB_ROOT}/modules/audio_processing/**/*.obj"
+            "${WEBRTC_LIB_ROOT}/common_audio/**/*.obj"
+            "${WEBRTC_LIB_ROOT}/audio/utility/**/*.obj"
+            "${WEBRTC_LIB_ROOT}/rtc_base/**/*.obj"
+            "${WEBRTC_LIB_ROOT}/system_wrappers/**/*.obj"
+            "${WEBRTC_LIB_ROOT}/third_party/pffft/**/*.obj"
+            "${WEBRTC_LIB_ROOT}/third_party/protobuf/**/*.obj"
+        )
+        list(APPEND WEBRTC_LIBS ${WEBRTC_LIB_FILES} ${WEBRTC_OBJ_FILES})
+    else()
     file(GLOB WEBRTC_APM_LIBS "${WEBRTC_LIB_ROOT}/modules/audio_processing/*.a")
     file(GLOB_RECURSE WEBRTC_APM_SUB_LIBS "${WEBRTC_LIB_ROOT}/modules/audio_processing/**/*.a")
     file(GLOB WEBRTC_AUDIO_CODING_ROOT_LIBS "${WEBRTC_LIB_ROOT}/modules/audio_coding/*.a")
@@ -182,6 +209,7 @@ if (WEBRTC_LIB_DIR AND WEBRTC_LIBS STREQUAL "")
             list(APPEND WEBRTC_LIBS "${WEBRTC_API_AUDIO_LIB}")
         endif()
     endif()
+    endif()
 endif()
 if (WEBRTC_LIBS)
     list(REMOVE_DUPLICATES WEBRTC_LIBS)
@@ -216,6 +244,21 @@ target_include_directories(gstwebrtcaec3 PRIVATE ${GST_INCLUDE_DIRS})
 target_link_libraries(gstwebrtcaec3 PRIVATE ${GST_LIBRARIES} ${WEBRTC_LIBS})
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     target_compile_options(gstwebrtcaec3 PRIVATE -Wno-nullability-completeness)
+endif()
+if (MSVC)
+    add_compile_options(/utf-8 /EHsc)
+endif()
+if (WIN32)
+    target_link_libraries(gstwebrtcaec3 PRIVATE
+        winmm
+        ws2_32
+        secur32
+        dmoguids
+        wmcodecdspuuid
+        msdmo
+        strmiids
+        iphlpapi
+    )
 endif()
 if (WEBRTC_LIB_DIR)
     file(GLOB_RECURSE WEBRTC_ABSL_OBJS
