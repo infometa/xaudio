@@ -203,7 +203,7 @@ pip install -r requirements.txt
 $env:ONNXRUNTIME_ROOT="C:\path\to\onnxruntime-win-x64-<version>"
 ```
 
-5) Build WebRTC APM:
+5) Build WebRTC APM (recommended GN args for stable linking):
 ```powershell
 git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
 $env:PATH="$PWD\\depot_tools;$env:PATH"
@@ -212,9 +212,14 @@ cd $HOME\\webrtc
 fetch --nohooks webrtc
 gclient sync
 cd src
-gn gen out/Release --args="is_debug=false target_cpu=\"x64\" rtc_include_tests=false rtc_build_examples=false"
+gn gen out/Release --args="is_debug=false target_cpu=\"x64\" rtc_include_tests=false rtc_build_examples=false is_clang=false use_lld=false use_custom_libcxx=false use_static_crt=false"
 ninja -C out/Release modules/audio_processing:audio_processing
 ninja -C out/Release api/audio:builtin_audio_processing_builder
+```
+If you need static runtime (/MT), set `use_static_crt=true` and rebuild WebRTC.
+Or use helper script:
+```powershell
+.\scripts\build_webrtc_windows.ps1 -WebRtcRoot "C:\path\to\webrtc\src"
 ```
 
 6) In the repo root, set WebRTC paths:
@@ -237,6 +242,13 @@ $env:WEBRTC_LINK_OBJS="ON"
 ```powershell
 $env:GST_PLUGIN_PATH="$PWD\\native\\build\\gst-plugins"
 python -m app.main
+```
+
+Optional one-shot bootstrap + packaging:
+```powershell
+$env:WEBRTC_ROOT="C:\path\to\webrtc\src"
+$env:ONNXRUNTIME_ROOT="C:\path\to\onnxruntime"
+.\scripts\bootstrap_windows.ps1
 ```
 
 ## Build Native Plugins (AEC3 / DeepFilterNet)
@@ -337,15 +349,23 @@ UI shows:
 - `TCHAT_AGC_MAX_NOISE_DBFS`: AGC max output noise level (default -50).
 - `TCHAT_AEC_AUTO_DELAY`: enable automatic AEC delay estimation (default 1).
 - `TCHAT_AEC_DELAY_MS`: AEC stream delay in ms (0-500).
+- `TCHAT_AEC_DELAY_SMOOTHING`: AEC delay smoothing factor (default 0.6).
+- `TCHAT_AEC_DELAY_MIN_CHANGE_MS`: min delta to update stream-delay (default 5).
 - `TCHAT_HPF_ENABLED`: enable high-pass filter (default 1).
 - `TCHAT_HPF_CUTOFF_HZ`: HPF cutoff (Hz, default 100).
 - `TCHAT_DFN_MIX`: DFN dry/wet mix (0.0-1.0, default 0.85).
 - `TCHAT_DFN_POST_FILTER`: DFN post filter strength (0.0-1.0, default 0.1).
-- `TCHAT_DFN_VAD_LINK`: link VAD to DFN mix (default 1).
+- `TCHAT_DFN_VAD_LINK`: link VAD to DFN mix (default 0).
 - `TCHAT_DFN_MIX_SPEECH`: DFN mix while speaking (default 0.8).
 - `TCHAT_DFN_MIX_SILENCE`: DFN mix while silent (default 1.0).
 - `TCHAT_DFN_MIX_SMOOTHING`: DFN mix smoothing (default 0.15).
+- `TCHAT_DFN_STRICT_IO_CHECK`: verify DFN ONNX I/O names (default 1).
+- `TCHAT_DFN_ALLOW_SINGLE_MODEL`: allow single-model DFN fallback (default 0).
 - `TCHAT_DFN_ALLOW_DEFAULT_OUTPUT`: allow fallback to `emb` when DFN3 output names mismatch (default 0).
+- `TCHAT_VAD_PROB_SPEECH`: VAD speech threshold (default 0.6).
+- `TCHAT_VAD_PROB_SILENCE`: VAD silence threshold (default 0.3).
+- `TCHAT_VAD_SPEECH_HOLD_MS`: VAD speech hold time (ms, default 80).
+- `TCHAT_VAD_SILENCE_HOLD_MS`: VAD silence hold time (ms, default 200).
 - `TCHAT_EQ_ENABLED`: enable 3-band EQ (default 1).
 - `TCHAT_EQ_LOW_DB` / `TCHAT_EQ_MID_DB` / `TCHAT_EQ_HIGH_DB`: EQ gains (dB, default -2 / 2 / 1).
 - `TCHAT_CNG_ENABLED`: enable comfort noise (default 1).

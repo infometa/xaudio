@@ -85,12 +85,21 @@ class MediaEngine:
         self.aec_delay_ms = self._env_int("TCHAT_AEC_DELAY_MS", 0)
         self.dfn_mix = self._env_float("TCHAT_DFN_MIX", 0.85)
         self.dfn_post_filter = self._env_float("TCHAT_DFN_POST_FILTER", 0.1)
-        self.dfn_vad_link = self._env_flag_default("TCHAT_DFN_VAD_LINK", True)
+        self.dfn_vad_link = self._env_flag_default("TCHAT_DFN_VAD_LINK", False)
         self.dfn_mix_speech = self._env_float("TCHAT_DFN_MIX_SPEECH", 0.8)
         self.dfn_mix_silence = self._env_float("TCHAT_DFN_MIX_SILENCE", 1.0)
         self.dfn_mix_smoothing = self._env_float("TCHAT_DFN_MIX_SMOOTHING", 0.15)
+        self.dfn_strict_io_check = self._env_flag_default("TCHAT_DFN_STRICT_IO_CHECK", True)
+        self.dfn_allow_single_model = self._env_flag_default("TCHAT_DFN_ALLOW_SINGLE_MODEL", False)
         self.dfn_auto_mix = 1.0
         self.dfn_auto_bypass = False
+        self.vad_prob_speech = self._env_float("TCHAT_VAD_PROB_SPEECH", 0.6)
+        self.vad_prob_silence = self._env_float("TCHAT_VAD_PROB_SILENCE", 0.3)
+        self.vad_hold_speech_ms = self._env_int("TCHAT_VAD_SPEECH_HOLD_MS", 80)
+        self.vad_hold_silence_ms = self._env_int("TCHAT_VAD_SILENCE_HOLD_MS", 200)
+        self._vad_effective = False
+        self._vad_pending = None
+        self._vad_pending_since = None
         self.limiter_threshold_db = self._env_float("TCHAT_LIMITER_THRESHOLD_DB", -1.0)
         self.limiter_attack_ms = self._env_float("TCHAT_LIMITER_ATTACK_MS", 5.0)
         self.limiter_release_ms = self._env_float("TCHAT_LIMITER_RELEASE_MS", 80.0)
@@ -102,9 +111,18 @@ class MediaEngine:
         self.aec_active = None
         self.dfn_active = None
         self.limiter_active = None
+        self.aec_erle_db = None
+        self.aec_erl_db = None
+        self.aec_delay_estimate_ms = None
+        self._aec_delay_last_update_ts = 0.0
+        self.aec_delay_smoothing = self._env_float("TCHAT_AEC_DELAY_SMOOTHING", 0.6)
+        self.aec_delay_min_change_ms = self._env_int("TCHAT_AEC_DELAY_MIN_CHANGE_MS", 5)
+        self._dfn_io_cache = {}
         self.send_enabled = True
         self.on_error = None
+        self.on_warning = None
         self.last_error = None
+        self.last_warning = None
         self._handling_error = False
 
     def list_devices(self):
@@ -124,8 +142,10 @@ class MediaEngine:
                 props = device.get_properties()
                 device_class = device.get_device_class()
                 display_name = device.get_display_name()
-                
+
                 device_id = None
+                device_api = None
+                device_bus = None
                 if props:
                     success, val = props.get_uint("device.api.coreaudio.id")
                     if success and val > 0:
@@ -133,27 +153,119 @@ class MediaEngine:
                     else:
                         device_id_str = props.get_string("device.id")
                         if device_id_str:
-                            try:
-                                device_id = int(device_id_str)
-                            except ValueError:
-                                device_id = None
-                
+                            device_id = device_id_str
+                    device_api = props.get_string("device.api")
+                    device_bus = props.get_string("device.bus_path")
+                    if device_id is None and device_bus:
+                        device_id = device_bus
+
+                name = display_name
+                if device_api and sys.platform.startswith("win"):
+                    name = f"{display_name} ({device_api})"
+
                 device_info = {
-                    "name": display_name,
+                    "name": name,
                     "id": device_id,
+                    "api": device_api,
+                    "bus_path": device_bus,
                 }
-                
+
                 if "Source" in device_class:
                     sources.append(device_info)
                 elif "Sink" in device_class:
                     sinks.append(device_info)
-                    
+
         except Exception as e:
             self.logger.warning(f"Failed to enumerate audio devices: {e}")
         finally:
             monitor.stop()
         
         return sources, sinks
+
+    def _emit_warning(self, message):
+        self.last_warning = message
+        if self.on_warning:
+            self.on_warning(message)
+
+    def _resolve_device_id(self, device_id, devices, label):
+        if device_id is None:
+            return None
+        device_api = None
+        if isinstance(device_id, dict):
+            device_api = device_id.get("api")
+            device_id = device_id.get("id")
+        device_id_str = str(device_id)
+        for dev in devices:
+            if str(dev.get("id")) == device_id_str:
+                return dev
+        api_text = f" ({device_api})" if device_api else ""
+        self.logger.warning("%s device '%s'%s not available; falling back to default", label, device_id, api_text)
+        self._emit_warning(f"{label}设备不可用，已回落为系统默认。")
+        return None
+
+    def _check_required_plugins(self, disable_aec, disable_dfn):
+        missing = []
+        if not disable_aec and not Gst.ElementFactory.find("webrtcaec3"):
+            missing.append("webrtcaec3")
+        if not disable_dfn and not Gst.ElementFactory.find("deepfilternet"):
+            missing.append("deepfilternet")
+        if missing:
+            raise RuntimeError(f"GStreamer 插件缺失：{', '.join(missing)}")
+
+    def _get_onnx_io_names(self, path):
+        cached = self._dfn_io_cache.get(path)
+        if cached:
+            return cached
+        try:
+            import onnxruntime as ort
+        except Exception as exc:
+            raise RuntimeError(f"ONNX Runtime 不可用：{exc}") from exc
+        sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        inputs = [entry.name for entry in sess.get_inputs()]
+        outputs = [entry.name for entry in sess.get_outputs()]
+        self._dfn_io_cache[path] = (inputs, outputs)
+        return inputs, outputs
+
+    def _check_dfn_models(self):
+        models_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "models"))
+        dfn_dir = os.path.join(models_root, "DeepFilterNet")
+        if os.path.isdir(dfn_dir):
+            required = ["enc.onnx", "erb_dec.onnx", "df_dec.onnx", "config.ini"]
+            missing = [name for name in required if not os.path.exists(os.path.join(dfn_dir, name))]
+            if missing:
+                raise RuntimeError(f"DFN3 模型缺失：{', '.join(missing)}")
+            if self.dfn_strict_io_check:
+                enc_inputs, enc_outputs = self._get_onnx_io_names(os.path.join(dfn_dir, "enc.onnx"))
+                erb_inputs, erb_outputs = self._get_onnx_io_names(os.path.join(dfn_dir, "erb_dec.onnx"))
+                df_inputs, df_outputs = self._get_onnx_io_names(os.path.join(dfn_dir, "df_dec.onnx"))
+                required_enc_inputs = {"feat_erb", "feat_spec"}
+                required_enc_outputs = {"e0", "e1", "e2", "e3", "emb", "c0"}
+                missing_inputs = sorted(required_enc_inputs - set(enc_inputs))
+                missing_outputs = sorted(required_enc_outputs - set(enc_outputs))
+                if missing_inputs or missing_outputs:
+                    raise RuntimeError(
+                        f"DFN3 enc.onnx I/O 不匹配：缺少输入{missing_inputs} 输出{missing_outputs}"
+                    )
+                for name in erb_inputs:
+                    if name not in enc_outputs:
+                        raise RuntimeError(f"DFN3 erb_dec.onnx 输入 {name} 不在 enc 输出中")
+                for name in df_inputs:
+                    if name not in enc_outputs:
+                        raise RuntimeError(f"DFN3 df_dec.onnx 输入 {name} 不在 enc 输出中")
+                if "coefs" not in df_outputs:
+                    raise RuntimeError("DFN3 df_dec.onnx 输出缺少 coefs")
+            return
+
+        if not self.dfn_allow_single_model:
+            raise RuntimeError("未找到 DFN3 模型目录（models/DeepFilterNet）")
+
+        model_path = os.path.join(models_root, "deepfilternet.onnx")
+        if not os.path.exists(model_path):
+            raise RuntimeError("DFN 单模型缺失：models/deepfilternet.onnx")
+        if self.dfn_strict_io_check:
+            inputs, outputs = self._get_onnx_io_names(model_path)
+            if "input" not in inputs or "output" not in outputs:
+                raise RuntimeError("DFN 单模型 I/O 名称应为 input/output")
 
     def start(self, local_port, remote_ip, remote_port, input_device=None, output_device=None):
         with self.lock:
@@ -183,6 +295,8 @@ class MediaEngine:
             self.dfn_mix_speech = self._env_float("TCHAT_DFN_MIX_SPEECH", self.dfn_mix_speech)
             self.dfn_mix_silence = self._env_float("TCHAT_DFN_MIX_SILENCE", self.dfn_mix_silence)
             self.dfn_mix_smoothing = self._env_float("TCHAT_DFN_MIX_SMOOTHING", self.dfn_mix_smoothing)
+            self.dfn_strict_io_check = self._env_flag_default("TCHAT_DFN_STRICT_IO_CHECK", self.dfn_strict_io_check)
+            self.dfn_allow_single_model = self._env_flag_default("TCHAT_DFN_ALLOW_SINGLE_MODEL", self.dfn_allow_single_model)
             self.opus_bitrate = self._env_int("TCHAT_OPUS_BITRATE", self.opus_bitrate)
             self.opus_packet_loss = self._env_int("TCHAT_OPUS_PACKET_LOSS", self.opus_packet_loss)
             self.opus_fec = self._env_flag_default("TCHAT_OPUS_FEC", self.opus_fec)
@@ -207,8 +321,6 @@ class MediaEngine:
                 self.agc_enabled = False
             self.is_listen_only = remote_ip is None or remote_port is None
             self.last_local_port = local_port
-            self.last_input_device = input_device
-            self.last_output_device = output_device
             self.logger.info("Media mode: %s", "listen-only" if self.is_listen_only else "full-duplex")
             if self.is_listen_only:
                 self.cng_enabled = False
@@ -218,6 +330,16 @@ class MediaEngine:
                 self.logger.info("DFN disabled via TCHAT_DISABLE_DFN")
             if disable_agc:
                 self.logger.info("AGC disabled via TCHAT_DISABLE_AGC")
+
+            self._check_required_plugins(disable_aec, disable_dfn)
+            if not disable_dfn:
+                self._check_dfn_models()
+
+            sources, sinks = self.list_devices()
+            input_device = self._resolve_device_id(input_device, sources, "输入")
+            output_device = self._resolve_device_id(output_device, sinks, "输出")
+            self.last_input_device = input_device
+            self.last_output_device = output_device
 
             src = self._make_audio_src(input_device)
             self.audio_src = src
@@ -268,7 +390,7 @@ class MediaEngine:
             if self.aec and self.aec.find_property("hpf"):
                 self.aec.set_property("hpf", bool(self.hpf_enabled))
 
-            # Tee for branching to VAD and encoder (before AEC)
+            # Tee for branching to VAD and encoder (after AEC when enabled)
             capture_tee = Gst.ElementFactory.make("tee", "capture_tee")
             vad_q = self._make_queue("vad_q", max_buffers=10, leaky="downstream")
             
@@ -331,6 +453,8 @@ class MediaEngine:
                 else:
                     model_path = os.path.join(models_root, "deepfilternet.onnx")
                     self._set_if_prop(self.dfn, "model-path", model_path)
+            self.logger.info("AEC active: %s", self.aec_active)
+            self.logger.info("DFN active: %s", self.dfn_active)
 
             post_dfn_q = self._make_queue("post_dfn_q", max_buffers=10, leaky=False)
             self.send_enabled = not self.is_listen_only
@@ -493,20 +617,20 @@ class MediaEngine:
                     raise RuntimeError(f"Failed to create GStreamer element: {name}")
                 self.pipeline.add(element)
 
-            # Capture chain: src → tee (AEC runs on the main branch only)
-            self._link_many_or_raise("capture", src, audconv1, audres1, caps1, self.hpf, capture_q, capture_tee)
+            # Capture chain: src → [AEC] → tee (VAD taps after AEC when enabled)
+            if self.aec:
+                self._link_many_or_raise("capture", src, audconv1, audres1, caps1, self.hpf, capture_q, self.aec, capture_tee)
+            else:
+                self._link_many_or_raise("capture", src, audconv1, audres1, caps1, self.hpf, capture_q, capture_tee)
 
             # VAD branch: tee → queue → convert → resample → caps → appsink
             # This works in both modes since it comes from capture path
             self._link_tee_src_to("capture→vad", capture_tee, vad_q)
             self._link_many_or_raise("vad", vad_q, vad_conv, vad_res, vad_f32_caps, vad_lpf, vad_post_conv, vad_caps, self.vad_sink)
             
-            # Main branch: tee → queue → [AEC] → DFN → Limiter → Opus → RTP
+            # Main branch: tee → queue → DFN → Limiter → Opus → RTP
             self._link_tee_src_to("capture→dfn", capture_tee, dfn_q)
-            if self.aec:
-                encoder_chain = [dfn_q, self.aec, dfn_in_caps, self.dfn, post_dfn_q, self.send_valve]
-            else:
-                encoder_chain = [dfn_q, dfn_in_caps, self.dfn, post_dfn_q, self.send_valve]
+            encoder_chain = [dfn_q, dfn_in_caps, self.dfn, post_dfn_q, self.send_valve]
 
             if self.cng_mixer:
                 self._link_many_or_raise("encoder_pre", *encoder_chain)
@@ -718,6 +842,12 @@ class MediaEngine:
             self.dfn_active = None
             self.limiter_active = None
             self.hpf_active = None
+            self.aec_erle_db = None
+            self.aec_erl_db = None
+            self.aec_delay_estimate_ms = None
+            self._vad_effective = False
+            self._vad_pending = None
+            self._vad_pending_since = None
             self.eq_active = None
             self.cng_active = None
             self.udpsink = None
@@ -1030,6 +1160,24 @@ class MediaEngine:
                 self.dfn_auto_mix = float(auto_mix) if auto_mix is not None else self.dfn_auto_mix
                 self.dfn_auto_bypass = bool(auto_bypass) if auto_bypass is not None else self.dfn_auto_bypass
                 self.metrics.update_dfn_stats(p50, p95, bypass, auto_mix=auto_mix, auto_bypass=auto_bypass)
+            elif struct and struct.get_name() == "aec3-stats":
+                erle = struct.get_value("erle_db") if struct.has_field("erle_db") else None
+                erl = struct.get_value("erl_db") if struct.has_field("erl_db") else None
+                delay_est = struct.get_value("estimated_delay_ms") if struct.has_field("estimated_delay_ms") else None
+                stream_delay = struct.get_value("stream_delay_ms") if struct.has_field("stream_delay_ms") else None
+                self.aec_erle_db = float(erle) if erle is not None else self.aec_erle_db
+                self.aec_erl_db = float(erl) if erl is not None else self.aec_erl_db
+                if delay_est is not None:
+                    self.aec_delay_estimate_ms = int(delay_est)
+                self.metrics.update_aec_stats(erle_db=erle, erl_db=erl, delay_ms=delay_est)
+                if self.aec and self.aec_auto_delay and delay_est is not None and self.aec.find_property("stream-delay-ms"):
+                    now = time.monotonic()
+                    target = int(delay_est)
+                    if (now - self._aec_delay_last_update_ts) >= 0.2 and abs(target - self.aec_delay_ms) >= self.aec_delay_min_change_ms:
+                        smoothing = self._clamp(self.aec_delay_smoothing, 0.1, 0.9)
+                        self.aec_delay_ms = int(round(self.aec_delay_ms * smoothing + target * (1.0 - smoothing)))
+                        self.aec.set_property("stream-delay-ms", int(self.aec_delay_ms))
+                        self._aec_delay_last_update_ts = now
 
     def _on_send_probe(self, pad, info):
         buf = info.get_buffer()
@@ -1077,10 +1225,19 @@ class MediaEngine:
             self.logger.warning("Queue overrun: %s (%d)", name, count)
         self.metrics.update_queue_overrun(name, count)
 
-    def _make_audio_src(self, device_id):
+    def _make_audio_src(self, device_info):
+        device_id = device_info.get("id") if isinstance(device_info, dict) else device_info
+        device_api = device_info.get("api") if isinstance(device_info, dict) else None
         if sys.platform.startswith("win"):
-            src = Gst.ElementFactory.make("wasapisrc", "audiosrc")
-            src.set_property("low-latency", True)
+            if device_api == "directsound":
+                src = Gst.ElementFactory.make("directsoundsrc", "audiosrc")
+            else:
+                src = Gst.ElementFactory.make("wasapisrc", "audiosrc")
+            if not src:
+                self.logger.warning("Windows audio source not available; falling back to autoaudiosrc")
+                src = Gst.ElementFactory.make("autoaudiosrc", "audiosrc")
+            else:
+                self._set_if_prop(src, "low-latency", True)
         elif sys.platform == "darwin":
             src = Gst.ElementFactory.make("osxaudiosrc", "audiosrc")
             if not src:
@@ -1099,10 +1256,19 @@ class MediaEngine:
         self.logger.info(f"Created audio source: {src.get_factory().get_name()}")
         return src
 
-    def _make_audio_sink(self, device_id):
+    def _make_audio_sink(self, device_info):
+        device_id = device_info.get("id") if isinstance(device_info, dict) else device_info
+        device_api = device_info.get("api") if isinstance(device_info, dict) else None
         if sys.platform.startswith("win"):
-            sink = Gst.ElementFactory.make("wasapisink", "audiosink")
-            sink.set_property("low-latency", True)
+            if device_api == "directsound":
+                sink = Gst.ElementFactory.make("directsoundsink", "audiosink")
+            else:
+                sink = Gst.ElementFactory.make("wasapisink", "audiosink")
+            if not sink:
+                self.logger.warning("Windows audio sink not available; falling back to autoaudiosink")
+                sink = Gst.ElementFactory.make("autoaudiosink", "audiosink")
+            else:
+                self._set_if_prop(sink, "low-latency", True)
         elif sys.platform == "darwin":
             sink = Gst.ElementFactory.make("osxaudiosink", "audiosink")
             if not sink:
@@ -1168,15 +1334,38 @@ class MediaEngine:
 
     def _update_vad_driven_processing(self):
         data = self.metrics.snapshot()
-        speaking = bool(data.get("vad_speaking"))
+        vad_prob = data.get("vad_prob", 0.0) or 0.0
+        raw_speaking = bool(data.get("vad_speaking"))
+        speaking = raw_speaking
+        if vad_prob >= self.vad_prob_speech:
+            speaking = True
+        elif vad_prob <= self.vad_prob_silence:
+            speaking = False
+
+        now = time.monotonic()
+        if speaking != self._vad_effective:
+            if self._vad_pending != speaking:
+                self._vad_pending = speaking
+                self._vad_pending_since = now
+            else:
+                hold_ms = self.vad_hold_speech_ms if speaking else self.vad_hold_silence_ms
+                if self._vad_pending_since and (now - self._vad_pending_since) * 1000.0 >= hold_ms:
+                    self._vad_effective = speaking
+                    self._vad_pending = None
+                    self._vad_pending_since = None
+        else:
+            self._vad_pending = None
+            self._vad_pending_since = None
+
+        effective = self._vad_effective
         if self.dfn_vad_link and self.dfn and self.dfn.find_property("mix"):
-            target = self.dfn_mix_speech if speaking else self.dfn_mix_silence
+            target = self.dfn_mix_speech if effective else self.dfn_mix_silence
             target = self._clamp(target, 0.0, 1.0)
             if abs(target - self.dfn_mix) > 0.005:
                 smoothing = self._clamp(self.dfn_mix_smoothing, 0.05, 0.5)
                 self.dfn_mix = (self.dfn_mix * (1.0 - smoothing)) + (target * smoothing)
                 self.dfn.set_property("mix", self.dfn_mix)
-        self._update_cng_state(speaking)
+        self._update_cng_state(effective)
 
     def _update_cng_state(self, speaking):
         if not self.cng_mixer or not self.cng_volume or not self.cng_valve:
@@ -1352,6 +1541,8 @@ class MediaEngine:
             self.aec.set_property("auto-delay", bool(self.aec_auto_delay))
             if not self.aec_auto_delay:
                 return
+        if self.aec_delay_estimate_ms is not None:
+            return
         delay_ms = self._estimate_aec_delay_ms()
         if delay_ms is None:
             return

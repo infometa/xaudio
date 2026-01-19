@@ -11,6 +11,9 @@ class Metrics:
             "dfn_bypass": 0,
             "dfn_auto_mix": None,
             "dfn_auto_bypass": False,
+            "aec_erle_db": None,
+            "aec_erl_db": None,
+            "aec_delay_ms": None,
             "queue_depths": {},
             "queue_overruns": {},
             "jitter_depth": None,
@@ -33,6 +36,16 @@ class Metrics:
                 self._data["dfn_auto_mix"] = auto_mix
             if auto_bypass is not None:
                 self._data["dfn_auto_bypass"] = auto_bypass
+            self._data["last_update"] = time.time()
+
+    def update_aec_stats(self, erle_db=None, erl_db=None, delay_ms=None):
+        with self._lock:
+            if erle_db is not None:
+                self._data["aec_erle_db"] = erle_db
+            if erl_db is not None:
+                self._data["aec_erl_db"] = erl_db
+            if delay_ms is not None:
+                self._data["aec_delay_ms"] = delay_ms
             self._data["last_update"] = time.time()
 
     def update_queue_depth(self, name, depth):
@@ -89,6 +102,9 @@ class Metrics:
             self._data["vad_energy_db"] = None
             self._data["dfn_auto_mix"] = None
             self._data["dfn_auto_bypass"] = False
+            self._data["aec_erle_db"] = None
+            self._data["aec_erl_db"] = None
+            self._data["aec_delay_ms"] = None
             self._data["input_sample_rate"] = None
             self._data["target_sample_rate"] = None
             self._data["last_update"] = time.time()

@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <absl/types/optional.h>
 
 #ifndef PACKAGE
 #define PACKAGE "tchat"
@@ -38,6 +39,8 @@ struct _GstWebRtcAec3 {
     gint delay_step_ms;
     gint delay_update_frames;
     gint delay_frame_count;
+    guint stats_interval_frames;
+    guint stats_frame_count;
     float delay_smoothing;
     float delay_corr_threshold;
     std::vector<float> render_ring;
@@ -159,6 +162,52 @@ static void gst_webrtc_aec3_update_rate(GstWebRtcAec3 *self, gint rate) {
     g_mutex_unlock(&self->lock);
 }
 
+static gboolean gst_webrtc_aec3_stats_value(const absl::optional<float> &value, float *out) {
+    if (!value.has_value()) {
+        return FALSE;
+    }
+    *out = value.value();
+    return TRUE;
+}
+
+static gboolean gst_webrtc_aec3_stats_value(const absl::optional<double> &value, float *out) {
+    if (!value.has_value()) {
+        return FALSE;
+    }
+    *out = static_cast<float>(value.value());
+    return TRUE;
+}
+
+static gboolean gst_webrtc_aec3_stats_value(float value, float *out) {
+    *out = value;
+    return TRUE;
+}
+
+static gboolean gst_webrtc_aec3_stats_value(double value, float *out) {
+    *out = static_cast<float>(value);
+    return TRUE;
+}
+
+static void gst_webrtc_aec3_post_stats(GstWebRtcAec3 *self,
+                                       gboolean have_erle,
+                                       float erle_db,
+                                       gboolean have_erl,
+                                       float erl_db,
+                                       gint estimated_delay_ms,
+                                       gint stream_delay_ms) {
+    GstStructure *s = gst_structure_new("aec3-stats",
+                                        "estimated_delay_ms", G_TYPE_INT, estimated_delay_ms,
+                                        "stream_delay_ms", G_TYPE_INT, stream_delay_ms,
+                                        nullptr);
+    if (have_erle) {
+        gst_structure_set(s, "erle_db", G_TYPE_FLOAT, erle_db, nullptr);
+    }
+    if (have_erl) {
+        gst_structure_set(s, "erl_db", G_TYPE_FLOAT, erl_db, nullptr);
+    }
+    gst_element_post_message(GST_ELEMENT(self), gst_message_new_element(GST_OBJECT(self), s));
+}
+
 static GstFlowReturn gst_webrtc_aec3_process_capture(GstWebRtcAec3 *self, GstBuffer *inbuf) {
     GstMapInfo map_in;
     if (!gst_buffer_map(inbuf, &map_in, GST_MAP_READ)) {
@@ -179,6 +228,14 @@ static GstFlowReturn gst_webrtc_aec3_process_capture(GstWebRtcAec3 *self, GstBuf
     float *out = reinterpret_cast<float *>(map_out.data);
 
     gst_webrtc_aec3_ensure_apm(self);
+
+    gboolean post_stats = FALSE;
+    gboolean have_erle = FALSE;
+    gboolean have_erl = FALSE;
+    float erle_db = 0.0f;
+    float erl_db = 0.0f;
+    gint stats_est_delay_ms = 0;
+    gint stats_stream_delay_ms = 0;
 
     if (self->priv->apm && !self->bypass) {
         webrtc::StreamConfig cfg(self->sample_rate, 1);
@@ -237,9 +294,25 @@ static GstFlowReturn gst_webrtc_aec3_process_capture(GstWebRtcAec3 *self, GstBuf
         }
         self->priv->apm->set_stream_delay_ms(self->stream_delay_ms);
         self->priv->apm->ProcessStream(in_ptr, cfg, cfg, out_ptr);
+        if (self->stats_interval_frames > 0) {
+            self->stats_frame_count += 1;
+            if (self->stats_frame_count >= self->stats_interval_frames) {
+                self->stats_frame_count = 0;
+                auto stats = self->priv->apm->GetStatistics();
+                have_erle = gst_webrtc_aec3_stats_value(stats.echo_return_loss_enhancement, &erle_db);
+                have_erl = gst_webrtc_aec3_stats_value(stats.echo_return_loss, &erl_db);
+                stats_est_delay_ms = self->estimated_delay_ms;
+                stats_stream_delay_ms = self->stream_delay_ms;
+                post_stats = TRUE;
+            }
+        }
         g_mutex_unlock(&self->lock);
     } else {
         memcpy(out, in, self->frame_bytes);
+    }
+
+    if (post_stats) {
+        gst_webrtc_aec3_post_stats(self, have_erle, erle_db, have_erl, erl_db, stats_est_delay_ms, stats_stream_delay_ms);
     }
 
     GstClockTime pts = GST_BUFFER_PTS(inbuf);
@@ -540,6 +613,7 @@ static GstStateChangeReturn gst_webrtc_aec3_change_state(GstElement *element, Gs
             self->render_ring_pos = 0;
             std::fill(self->render_ring.begin(), self->render_ring.end(), 0.0f);
             self->delay_frame_count = 0;
+            self->stats_frame_count = 0;
             self->estimated_delay_ms = self->stream_delay_ms;
             if (self->priv->apm) {
                 self->priv->apm->Initialize();
@@ -566,6 +640,8 @@ static void gst_webrtc_aec3_init(GstWebRtcAec3 *self) {
     self->delay_step_ms = 10;
     self->delay_update_frames = 10;
     self->delay_frame_count = 0;
+    self->stats_interval_frames = 50;
+    self->stats_frame_count = 0;
     self->delay_smoothing = 0.9f;
     self->delay_corr_threshold = 0.45f;
     self->agc_enabled = TRUE;

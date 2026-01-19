@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 project(tchat_native LANGUAGES C CXX)
 
+# Windows cache example:
+# cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Release -DWEBRTC_ROOT=... -DONNXRUNTIME_ROOT=... -DWEBRTC_LINK_OBJS=ON -DWEBRTC_LINK_LIBS=OFF
+
 if (WIN32)
     set(CMAKE_CXX_STANDARD 20)
 else()
@@ -132,6 +135,7 @@ endif()
 
 if (WEBRTC_LIB_DIR AND WEBRTC_LIBS STREQUAL "")
     if (WIN32)
+        message(STATUS "WebRTC Windows link: LIBS=${WEBRTC_LINK_LIBS} OBJS=${WEBRTC_LINK_OBJS}")
         if (WEBRTC_LINK_LIBS)
             file(GLOB_RECURSE WEBRTC_LIB_FILES
                 "${WEBRTC_LIB_ROOT}/api/**/*.lib"

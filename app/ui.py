@@ -36,6 +36,7 @@ class MainWindow(QtWidgets.QMainWindow):
     connected_signal = QtCore.Signal(tuple)
     disconnected_signal = QtCore.Signal()
     media_error_signal = QtCore.Signal(str)
+    media_warning_signal = QtCore.Signal(str)
     
     def __init__(self, media, signaling, metrics, initial_port=5004, auto_listen=False, auto_call=None):
         super().__init__()
@@ -111,6 +112,27 @@ class MainWindow(QtWidgets.QMainWindow):
         button_layout.addWidget(self.call_button)
         button_layout.addWidget(self.hangup_button)
 
+        pipeline_card = QtWidgets.QFrame()
+        pipeline_card.setObjectName("pipelineCard")
+        pipeline_layout = QtWidgets.QVBoxLayout(pipeline_card)
+        pipeline_layout.setContentsMargins(12, 10, 12, 10)
+        pipeline_layout.setSpacing(6)
+        pipeline_title = QtWidgets.QLabel("当前音频处理流程")
+        pipeline_title.setObjectName("pipelineTitle")
+        self.pipeline_main = QtWidgets.QLabel()
+        self.pipeline_main.setWordWrap(True)
+        self.pipeline_main.setObjectName("pipelineFlow")
+        self.pipeline_vad = QtWidgets.QLabel()
+        self.pipeline_vad.setWordWrap(True)
+        self.pipeline_vad.setObjectName("pipelineFlow")
+        self.pipeline_downlink = QtWidgets.QLabel()
+        self.pipeline_downlink.setWordWrap(True)
+        self.pipeline_downlink.setObjectName("pipelineFlow")
+        pipeline_layout.addWidget(pipeline_title)
+        pipeline_layout.addWidget(self.pipeline_main)
+        pipeline_layout.addWidget(self.pipeline_vad)
+        pipeline_layout.addWidget(self.pipeline_downlink)
+
         status_group = QtWidgets.QGroupBox("通话状态")
         status_layout = QtWidgets.QFormLayout()
         self.status_label = QtWidgets.QLabel("空闲")
@@ -159,6 +181,8 @@ class MainWindow(QtWidgets.QMainWindow):
         dfn_post_widget = QtWidgets.QWidget()
         dfn_post_widget.setLayout(dfn_post_wrap)
 
+        self.dfn_vad_link_main = QtWidgets.QCheckBox()
+
         self.aec_status = QtWidgets.QLabel("-")
         self.dfn_status = QtWidgets.QLabel("-")
         self.hpf_status = QtWidgets.QLabel("-")
@@ -178,6 +202,7 @@ class MainWindow(QtWidgets.QMainWindow):
         processing_form.addRow("DFN 启用", self.dfn_enable)
         processing_form.addRow("降噪等级（DFN Mix）", dfn_mix_widget)
         processing_form.addRow("后滤波（Post Filter）", dfn_post_widget)
+        processing_form.addRow("VAD 联动降噪", self.dfn_vad_link_main)
         processing_form.addRow("AEC 状态", self.aec_status)
         processing_form.addRow("DFN 状态", self.dfn_status)
         processing_form.addRow("HPF 状态", self.hpf_status)
@@ -437,6 +462,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "dfn_p95": "降噪 P95（DFN P95, ms）",
             "dfn_bypass": "降噪旁路（DFN Bypass）",
             "dfn_auto_mix": "降噪自动混合（DFN Auto Mix）",
+            "aec_erle": "回声消除 ERLE（ERLE, dB）",
+            "aec_erl": "回声消除 ERL（ERL, dB）",
+            "aec_delay": "AEC 延迟估计（ms）",
             "queue_depth": "队列深度（Queue Depth）",
             "jitter_depth": "抖动缓冲（Jitter）",
             "mic_send": "麦克风→发送（Mic→Send, ms）",
@@ -448,6 +476,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dfn_p95 = self._make_metric_label(self.metric_titles["dfn_p95"])
         self.dfn_bypass = self._make_metric_label(self.metric_titles["dfn_bypass"])
         self.dfn_auto_mix = self._make_metric_label(self.metric_titles["dfn_auto_mix"])
+        self.aec_erle = self._make_metric_label(self.metric_titles["aec_erle"])
+        self.aec_erl = self._make_metric_label(self.metric_titles["aec_erl"])
+        self.aec_delay_metric = self._make_metric_label(self.metric_titles["aec_delay"])
         self.queue_depth = self._make_metric_label(self.metric_titles["queue_depth"])
         self.jitter_depth = self._make_metric_label(self.metric_titles["jitter_depth"])
         self.mic_send = self._make_metric_label(self.metric_titles["mic_send"])
@@ -458,6 +489,9 @@ class MainWindow(QtWidgets.QMainWindow):
         metrics_layout.addWidget(self.dfn_p95)
         metrics_layout.addWidget(self.dfn_bypass)
         metrics_layout.addWidget(self.dfn_auto_mix)
+        metrics_layout.addWidget(self.aec_erle)
+        metrics_layout.addWidget(self.aec_erl)
+        metrics_layout.addWidget(self.aec_delay_metric)
         metrics_layout.addWidget(self.queue_depth)
         metrics_layout.addWidget(self.jitter_depth)
         metrics_layout.addWidget(self.mic_send)
@@ -471,6 +505,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left_col.addWidget(device_group)
         left_col.addWidget(conn_group)
         left_col.addLayout(button_layout)
+        left_col.addWidget(pipeline_card)
         left_col.addStretch(1)
 
         status_tab = QtWidgets.QWidget()
@@ -530,6 +565,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dfn_mix_slider.valueChanged.connect(self._on_dfn_mix_changed)
         self.dfn_post_slider.valueChanged.connect(self._on_dfn_post_changed)
         self.dfn_vad_link.toggled.connect(self._on_dfn_vad_link_toggle)
+        self.dfn_vad_link_main.toggled.connect(self._on_dfn_vad_link_toggle)
         self.dfn_mix_speech_slider.valueChanged.connect(self._on_dfn_mix_speech_changed)
         self.dfn_mix_silence_slider.valueChanged.connect(self._on_dfn_mix_silence_changed)
         self.eq_enable.toggled.connect(self._on_eq_toggle)
@@ -550,11 +586,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.connected_signal.connect(self._on_connected_slot)
         self.disconnected_signal.connect(self._on_disconnected_slot)
         self.media_error_signal.connect(self._on_media_error_slot)
+        self.media_warning_signal.connect(self._on_media_warning_slot)
         
         # Set callbacks that emit signals (thread-safe)
         self.signaling.on_connected = self._on_connected_callback
         self.signaling.on_disconnected = self._on_disconnected_callback
         self.media.on_error = self._on_media_error_callback
+        self.media.on_warning = self._on_media_warning_callback
 
     def _refresh_devices(self):
         current_input = self.input_combo.currentData()
@@ -563,8 +601,8 @@ class MainWindow(QtWidgets.QMainWindow):
         current_output_text = self.output_combo.currentText()
         sources, sinks = self.media.list_devices()
         signature = (
-            tuple(sorted((str(dev.get("id")), dev.get("name", "")) for dev in sources)),
-            tuple(sorted((str(dev.get("id")), dev.get("name", "")) for dev in sinks)),
+            tuple(sorted((str(dev.get("id")), dev.get("name", ""), dev.get("api", "")) for dev in sources)),
+            tuple(sorted((str(dev.get("id")), dev.get("name", ""), dev.get("api", "")) for dev in sinks)),
         )
         if getattr(self, "_device_signature", None) == signature:
             return
@@ -579,13 +617,13 @@ class MainWindow(QtWidgets.QMainWindow):
             name = dev["name"]
             if "built-in" in name.lower() or "default" in name.lower():
                 name = f"{name}"
-            self.input_combo.addItem(name, dev["id"])
+            self.input_combo.addItem(name, dev)
         
         for dev in sinks:
             name = dev["name"]
             if "built-in" in name.lower() or "default" in name.lower():
                 name = f"{name}"
-            self.output_combo.addItem(name, dev["id"])
+            self.output_combo.addItem(name, dev)
         
         idx = self.input_combo.findData(current_input)
         if idx < 0 and current_input_text:
@@ -633,6 +671,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 if auto_bypass:
                     auto_text += "（自动降级）"
             self._set_metric(self.dfn_auto_mix, self.metric_titles["dfn_auto_mix"], auto_text)
+        if self.media.aec_active is False:
+            self._set_metric(self.aec_erle, self.metric_titles["aec_erle"], "不可用")
+            self._set_metric(self.aec_erl, self.metric_titles["aec_erl"], "不可用")
+            self._set_metric(self.aec_delay_metric, self.metric_titles["aec_delay"], "-")
+        else:
+            self._set_metric(self.aec_erle, self.metric_titles["aec_erle"], self._fmt(data.get("aec_erle_db")))
+            self._set_metric(self.aec_erl, self.metric_titles["aec_erl"], self._fmt(data.get("aec_erl_db")))
+            self._set_metric(self.aec_delay_metric, self.metric_titles["aec_delay"], self._fmt(data.get("aec_delay_ms")))
         self._set_metric(self.jitter_depth, self.metric_titles["jitter_depth"], self._fmt_jitter(data.get("jitter_depth"), data.get("jitter_kind")))
         self._set_metric(self.mic_send, self.metric_titles["mic_send"], self._fmt(data.get("mic_send_latency_ms")))
         self._set_metric(self.vad_prob, self.metric_titles["vad_prob"], self._fmt(data.get("vad_prob")))
@@ -771,6 +817,18 @@ class MainWindow(QtWidgets.QMainWindow):
             border-radius: 8px;
             padding: 6px 8px;
         }
+        QFrame#pipelineCard {
+            background: #FFFFFF;
+            border: 1px solid #E0E7F0;
+            border-radius: 12px;
+        }
+        QLabel#pipelineTitle {
+            color: #4B5B71;
+            font-weight: 600;
+        }
+        QLabel#pipelineFlow {
+            color: #1F2937;
+        }
         QSlider::groove:horizontal {
             height: 6px;
             background: #E7EDF5;
@@ -851,6 +909,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_pipeline_flags(self):
         aec_text = self._format_flag(self.media.disable_aec_env, self.media.aec_active, self.media.aec_enabled)
+        if self.media.aec_active is not False:
+            parts = [aec_text]
+            if self.media.aec_erle_db is not None:
+                parts.append(f"ERLE {self.media.aec_erle_db:.1f} dB")
+            if self.media.aec_erl_db is not None:
+                parts.append(f"ERL {self.media.aec_erl_db:.1f} dB")
+            if self.media.aec_delay_estimate_ms is not None:
+                parts.append(f"延迟 {self.media.aec_delay_estimate_ms} ms")
+            aec_text = " | ".join(parts)
         dfn_text = self._format_flag(self.media.disable_dfn_env, self.media.dfn_active, self.media.dfn_enabled)
         self.aec_status.setText(aec_text)
         self.dfn_status.setText(dfn_text)
@@ -858,6 +925,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self.eq_status.setText(self._format_module(self.media.eq_active, self.media.eq_enabled))
         self.cng_status.setText(self._format_module(self.media.cng_active, self.media.cng_enabled))
         self.limiter_status.setText(self._format_module(self.media.limiter_active, True))
+        self._update_pipeline_diagram()
+
+    def _update_pipeline_diagram(self):
+        def step(name, enabled=True, active=True):
+            if active is False:
+                return f"{name}(不可用)"
+            if not enabled:
+                return f"{name}(关)"
+            return name
+
+        hpf = step("HPF", self.media.hpf_enabled, self.media.hpf_active)
+        aec = step("AEC3", self.media.aec_enabled, self.media.aec_active)
+        dfn = step("DFN", self.media.dfn_enabled, self.media.dfn_active)
+        cng = step("CNG", self.media.cng_enabled, self.media.cng_active)
+        eq = step("EQ", self.media.eq_enabled, self.media.eq_active)
+        limiter = step("Limiter", True, self.media.limiter_active)
+
+        main_steps = ["采集", hpf, aec, dfn, cng, eq, limiter, "Opus", "RTP/UDP"]
+        main_steps = [s for s in main_steps if s]
+        main_text = " → ".join(main_steps)
+        if self.media.is_listen_only:
+            main_text += "（监听模式）"
+
+        vad_text = "AEC3 后 → VAD"
+        downlink_text = "RTP/UDP → Jitter → Opus → 播放"
+        if self.media.aec_active is not False:
+            downlink_text += "（AEC 参考）"
+
+        self.pipeline_main.setText(f"主链路：{main_text}")
+        self.pipeline_vad.setText(f"VAD 支路：{vad_text}")
+        self.pipeline_downlink.setText(f"下行：{downlink_text}")
         self._update_processing_controls()
 
     def _format_flag(self, disabled_env, active, enabled):
@@ -895,6 +993,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_checkbox_silent(self.eq_enable, self.media.eq_enabled)
         self._set_checkbox_silent(self.cng_enable, self.media.cng_enabled)
         self._set_checkbox_silent(self.dfn_vad_link, self.media.dfn_vad_link)
+        self._set_checkbox_silent(self.dfn_vad_link_main, self.media.dfn_vad_link)
         self._set_spin_silent(self.aec_delay, int(self.media.aec_delay_ms))
         self._set_slider_silent(self.dfn_mix_slider, int(self.media.dfn_mix * 100))
         self._set_slider_silent(self.dfn_post_slider, int(self.media.dfn_post_filter * 100))
@@ -954,6 +1053,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cng_enable.setEnabled(self.media.cng_active is not False)
         self.cng_level_slider.setEnabled(self.media.cng_active is not False and self.media.cng_enabled)
         self.dfn_vad_link.setEnabled(dfn_controls_enabled)
+        self.dfn_vad_link_main.setEnabled(dfn_controls_enabled)
         self.dfn_mix_speech_slider.setEnabled(dfn_controls_enabled and self.media.dfn_vad_link)
         self.dfn_mix_silence_slider.setEnabled(dfn_controls_enabled and self.media.dfn_vad_link)
         self.opus_bitrate.setEnabled(True)
@@ -1051,6 +1151,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_dfn_vad_link_toggle(self, checked):
         self.media.set_processing_options(dfn_vad_link=checked)
+        self._set_checkbox_silent(self.dfn_vad_link, checked)
+        self._set_checkbox_silent(self.dfn_vad_link_main, checked)
 
     def _on_dfn_mix_speech_changed(self, value):
         self.dfn_mix_speech_value.setText(f"{value}%")
@@ -1224,6 +1326,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_label_tone(self.speaking_label, "muted")
         self.is_calling = False
         self.call_button.setEnabled(True)
+        if not self.is_listening:
+            self.media.stop()
 
     # Thread-safe callbacks that emit signals
     def _on_connected_callback(self, remote_addr):
@@ -1279,9 +1383,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_label_tone(self.speaking_label, "muted")
         self.is_calling = False
         self.call_button.setEnabled(True)
+        if not self.is_listening:
+            self.media.stop()
 
     def _on_media_error_callback(self, message):
         self.media_error_signal.emit(message or "unknown")
+
+    def _on_media_warning_callback(self, message):
+        self.media_warning_signal.emit(message or "")
 
     @QtCore.Slot(str)
     def _on_media_error_slot(self, message):
@@ -1297,6 +1406,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.is_calling = False
         self.call_button.setEnabled(True)
         QtWidgets.QMessageBox.critical(self, "音频错误", f"音频管线错误：{message}")
+
+    @QtCore.Slot(str)
+    def _on_media_warning_slot(self, message):
+        if not message:
+            return
+        self.logger.warning("Media warning: %s", message)
+        QtWidgets.QMessageBox.information(self, "提示", message)
 
     def closeEvent(self, event):
         print("Closing application, cleaning up resources...")
